@@ -1,0 +1,20 @@
+{
+  "name": "@safr-x-atp-demo/storage",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@safr-x-atp-demo/protocol": "0.1.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "migrate": "tsx src/migrate.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}

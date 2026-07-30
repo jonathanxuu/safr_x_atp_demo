@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "declaration": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "paths": {
+      "@safr-x-atp-demo/protocol": [
+        "packages/protocol/src/index.ts"
+      ],
+      "@safr-x-atp-demo/storage": [
+        "packages/storage/src/index.ts"
+      ]
+    },
+    "outDir": "dist"
+  }
+}

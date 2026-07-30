@@ -1,0 +1,24 @@
+{
+  "name": "safr-x-atp-demo",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "services/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "dev": "npm run dev --workspaces --if-present",
+    "dev:up": "bash scripts/dev-up.sh",
+    "dev:down": "bash scripts/dev-down.sh",
+    "dev:status": "bash scripts/dev-status.sh",
+    "lint": "npm run lint --workspaces --if-present",
+    "db:migrate": "npm run migrate --workspace @safr-x-atp-demo/storage",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2"
+  }
+}
