@@ -993,6 +993,36 @@ export class BankRepository {
     }
   }
 
+  resetBalancesForOwners(ownerIds: string[]) {
+    const uniqueOwnerIds = Array.from(new Set(ownerIds.map((ownerId) => ownerId.trim()).filter(Boolean)));
+    if (uniqueOwnerIds.length === 0) {
+      return;
+    }
+
+    const now = new Date().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const ownerId of uniqueOwnerIds) {
+        this.db
+          .prepare(`
+            UPDATE bank_accounts
+            SET available_balance = CASE owner_role
+              WHEN 'transferor' THEN 25000
+              WHEN 'recipient' THEN 3200
+              ELSE available_balance
+            END,
+            updated_at = ?
+            WHERE owner_id = ?
+          `)
+          .run(now, ownerId);
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   reset() {
     this.db.exec("BEGIN IMMEDIATE");
     try {

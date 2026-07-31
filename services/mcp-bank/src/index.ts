@@ -241,6 +241,33 @@ const server = createServer(async (request, response) => {
     return;
   }
 
+  if (request.method === "POST" && url.pathname === "/admin/reset-balances") {
+    try {
+      const body = await readJson(request);
+      const ownerIds = [
+        typeof body.transferorOwnerId === "string" ? body.transferorOwnerId : "",
+        typeof body.recipientOwnerId === "string" ? body.recipientOwnerId : "",
+      ].filter(Boolean);
+
+      if (ownerIds.length === 0) {
+        throw new Error("At least one ownerId is required");
+      }
+
+      bankStore.resetBalancesForOwners(ownerIds);
+      sendJson(response, 200, {
+        ok: true,
+        service: "mcp-bank",
+        reset: "owner_balances_restored",
+        ownerIds,
+      });
+    } catch (error) {
+      sendJson(response, 400, {
+        error: error instanceof Error ? error.message : "Failed to reset account balances",
+      });
+    }
+    return;
+  }
+
   if (request.method === "POST" && url.pathname === "/accounts/bootstrap") {
     try {
       const body = await readJson(request);

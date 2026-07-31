@@ -729,6 +729,29 @@ export function App() {
     setStatus("Logged out");
   }
 
+  async function restoreOriginalBalances() {
+    try {
+      setStatus("Restoring original account balances...");
+      const response = await fetch(`${MCP_BANK_URL}/admin/reset-balances`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          transferorOwnerId: transferorPrincipalId,
+          recipientOwnerId: recipientPrincipalId,
+        }),
+      });
+      if (!response.ok) {
+        const body = (await response.json()) as { error?: string };
+        throw new Error(body.error ?? "Failed to restore original balances");
+      }
+
+      await refreshAll();
+      setStatus("Account balances restored to their original values");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Failed to restore balances");
+    }
+  }
+
   function getMissingPasskeyMessage() {
     const missing: string[] = [];
 
@@ -1382,6 +1405,9 @@ export function App() {
           </p>
         </div>
         <div className="heroActions">
+          <button className="danger" onClick={() => void restoreOriginalBalances()}>
+            Restore balances
+          </button>
           <button className="secondary" onClick={() => void handleLogout()}>
             Switch account
           </button>
