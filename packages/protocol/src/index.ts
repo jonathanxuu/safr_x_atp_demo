@@ -59,6 +59,33 @@ export function createDemoPrincipal(label: keyof typeof DEMO_PRINCIPAL_VALUES | 
   return createDeterministicPrincipal(`safr-x-atp-demo:${label}:principal:v1`);
 }
 
+export function normalizeAccountHandle(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+export function isEnglishAccountHandle(value: string): boolean {
+  return /^[A-Za-z][A-Za-z0-9_-]*$/.test(value.trim());
+}
+
+export function assertEnglishAccountHandle(value: string, label = "username"): string {
+  const normalized = value.trim();
+  if (!isEnglishAccountHandle(normalized)) {
+    throw new Error(`${label} must use English letters, numbers, underscores, or hyphens, and start with a letter`);
+  }
+  return normalized.toLowerCase();
+}
+
+export function createAccountScopedPrincipal(handle: string, role: "transferor" | "admin" | "recipient"): string {
+  const normalizedHandle = normalizeAccountHandle(handle);
+  const seed = `safr-x-atp-demo:account:${normalizedHandle}:${role}:principal:v1`;
+  const bytes = new Uint8Array(29);
+  for (let index = 0; index < seed.length; index += 1) {
+    const charCode = seed.charCodeAt(index);
+    bytes[index % bytes.length] = (bytes[index % bytes.length] * 31 + charCode + index) % 256;
+  }
+  return Principal.selfAuthenticating(bytes).toText();
+}
+
 export function createDemoPrincipals() {
   return {
     ...DEMO_PRINCIPAL_VALUES,

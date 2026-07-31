@@ -1,5 +1,10 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import {
+  assertEnglishAccountHandle,
+  createAccountScopedPrincipal,
+  normalizeAccountHandle,
+} from "@safr-x-atp-demo/protocol";
 
 export interface IdentityPrincipal {
   principalId: string;
@@ -51,8 +56,191 @@ export interface IdentityVerificationProof {
   payloadJson: string;
 }
 
+export interface AuthAccount {
+  username: string;
+  passwordSalt: string;
+  passwordHash: string;
+  transferorPrincipalId: string;
+  adminPrincipalId: string;
+  recipientPrincipalId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AuthSession {
+  sessionId: string;
+  username: string;
+  createdAt: string;
+  expiresAt: string;
+  lastSeenAt: string;
+  revokedAt?: string;
+}
+
 export class IdentityRepository {
   constructor(private readonly db: DatabaseSync) {}
+
+  createAuthAccount(input: { username: string; password: string }): AuthAccount {
+    const username = assertEnglishAccountHandle(input.username);
+    const existing = this.getAuthAccount(username);
+    if (existing) {
+      throw new Error("Username already exists");
+    }
+
+    const salt = randomBytes(16).toString("base64url");
+    const passwordHash = hashPassword(input.password, salt);
+    const now = new Date().toISOString();
+    const account: AuthAccount = {
+      username,
+      passwordSalt: salt,
+      passwordHash,
+      transferorPrincipalId: createAccountScopedPrincipal(username, "transferor"),
+      adminPrincipalId: createAccountScopedPrincipal(username, "admin"),
+      recipientPrincipalId: createAccountScopedPrincipal(username, "recipient"),
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    this.db.prepare(`
+      INSERT INTO auth_accounts (
+        username, password_salt, password_hash,
+        transferor_principal_id, admin_principal_id,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      account.username,
+      account.passwordSalt,
+      account.passwordHash,
+      account.transferorPrincipalId,
+      account.adminPrincipalId,
+      account.createdAt,
+      account.updatedAt,
+    );
+
+    this.ensurePrincipal({
+      principalId: account.transferorPrincipalId,
+      role: "transferor",
+      username: `${username}.transferor`,
+      displayName: `${username} Transferor`,
+    });
+    this.ensurePrincipal({
+      principalId: account.adminPrincipalId,
+      role: "administrator",
+      username: `${username}.admin`,
+      displayName: `${username} Administrator`,
+    });
+    this.ensurePrincipal({
+      principalId: account.recipientPrincipalId,
+      role: "recipient",
+      username: `${username}.recipient`,
+      displayName: `${username} Recipient`,
+    });
+
+    return account;
+  }
+
+  getAuthAccount(username: string): AuthAccount | undefined {
+    const normalized = normalizeAccountHandle(username);
+    const row = this.db.prepare(`
+      SELECT username, password_salt, password_hash,
+             transferor_principal_id, admin_principal_id,
+             created_at, updated_at
+      FROM auth_accounts
+      WHERE username = ?
+    `).get(normalized) as AuthAccountRow | undefined;
+
+    return row ? mapAuthAccountRow(row) : undefined;
+  }
+
+  verifyAuthAccount(username: string, password: string): AuthAccount | undefined {
+    const account = this.getAuthAccount(username);
+    if (!account) {
+      return undefined;
+    }
+
+    const candidate = hashPassword(password, account.passwordSalt);
+    const current = Buffer.from(account.passwordHash, "base64url");
+    const next = Buffer.from(candidate, "base64url");
+    if (current.length !== next.length || !timingSafeEqual(current, next)) {
+      return undefined;
+    }
+
+    return account;
+  }
+
+  createSession(username: string, ttlMinutes = 24 * 7): AuthSession {
+    const now = new Date();
+    const session: AuthSession = {
+      sessionId: `sess_${randomUUID()}`,
+      username: normalizeAccountHandle(username),
+      createdAt: now.toISOString(),
+      expiresAt: new Date(now.getTime() + ttlMinutes * 60 * 1000).toISOString(),
+      lastSeenAt: now.toISOString(),
+    };
+
+    this.db.prepare(`
+      INSERT INTO auth_sessions (
+        session_id, username, created_at, expires_at, last_seen_at, revoked_at
+      ) VALUES (?, ?, ?, ?, ?, NULL)
+    `).run(
+      session.sessionId,
+      session.username,
+      session.createdAt,
+      session.expiresAt,
+      session.lastSeenAt,
+    );
+
+    return session;
+  }
+
+  getSession(sessionId: string): AuthSession | undefined {
+    const row = this.db.prepare(`
+      SELECT session_id, username, created_at, expires_at, last_seen_at, revoked_at
+      FROM auth_sessions
+      WHERE session_id = ?
+    `).get(sessionId) as AuthSessionRow | undefined;
+
+    if (!row) {
+      return undefined;
+    }
+
+    return mapAuthSessionRow(row);
+  }
+
+  getActiveSession(sessionId: string): AuthSession | undefined {
+    const session = this.getSession(sessionId);
+    if (!session || session.revokedAt) {
+      return undefined;
+    }
+    const expiresAt = new Date(session.expiresAt).getTime();
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+      return undefined;
+    }
+    return session;
+  }
+
+  revokeSession(sessionId: string) {
+    this.db.prepare(`
+      UPDATE auth_sessions
+      SET revoked_at = ?
+      WHERE session_id = ?
+    `).run(new Date().toISOString(), sessionId);
+  }
+
+  touchSession(sessionId: string) {
+    this.db.prepare(`
+      UPDATE auth_sessions
+      SET last_seen_at = ?
+      WHERE session_id = ?
+    `).run(new Date().toISOString(), sessionId);
+  }
+
+  getAccountBySession(sessionId: string): AuthAccount | undefined {
+    const session = this.getActiveSession(sessionId);
+    if (!session) {
+      return undefined;
+    }
+    return this.getAuthAccount(session.username);
+  }
 
   ensurePrincipal(input: {
     principalId: string;
@@ -255,11 +443,19 @@ export class IdentityRepository {
   getPrincipalPasskeyStatus(principalId: string) {
     const principal = this.getPrincipal(principalId);
     const credentials = this.listCredentials(principalId);
-    const latestProof = this.db.prepare(`
+    const latestAuthenticationProof = this.db.prepare(`
       SELECT proof_id, principal_id, role, credential_id, challenge_id, proof_type, verified,
              origin, rp_id, sign_count, created_at, payload_json
       FROM identity_verification_proofs
       WHERE principal_id = ? AND proof_type = 'authentication'
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).get(principalId) as ProofRow | undefined;
+    const latestVerifiedProof = this.db.prepare(`
+      SELECT proof_id, principal_id, role, credential_id, challenge_id, proof_type, verified,
+             origin, rp_id, sign_count, created_at, payload_json
+      FROM identity_verification_proofs
+      WHERE principal_id = ? AND verified = 1
       ORDER BY created_at DESC
       LIMIT 1
     `).get(principalId) as ProofRow | undefined;
@@ -268,7 +464,8 @@ export class IdentityRepository {
       principal,
       registered: credentials.length > 0,
       credentials,
-      latestAuthenticationProof: latestProof ? mapProofRow(latestProof) : undefined,
+      latestAuthenticationProof: latestAuthenticationProof ? mapProofRow(latestAuthenticationProof) : undefined,
+      latestVerifiedProof: latestVerifiedProof ? mapProofRow(latestVerifiedProof) : undefined,
     };
   }
 
@@ -279,6 +476,8 @@ export class IdentityRepository {
       this.db.prepare("DELETE FROM identity_webauthn_challenges").run();
       this.db.prepare("DELETE FROM identity_passkey_credentials").run();
       this.db.prepare("DELETE FROM identity_principals").run();
+      this.db.prepare("DELETE FROM auth_sessions").run();
+      this.db.prepare("DELETE FROM auth_accounts").run();
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -337,6 +536,25 @@ interface ProofRow {
   payload_json: string;
 }
 
+interface AuthAccountRow {
+  username: string;
+  password_salt: string;
+  password_hash: string;
+  transferor_principal_id: string;
+  admin_principal_id: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface AuthSessionRow {
+  session_id: string;
+  username: string;
+  created_at: string;
+  expires_at: string;
+  last_seen_at: string;
+  revoked_at: string | null;
+}
+
 function mapPrincipalRow(row: PrincipalRow): IdentityPrincipal {
   return {
     principalId: row.principal_id,
@@ -393,4 +611,33 @@ function mapProofRow(row: ProofRow): IdentityVerificationProof {
     createdAt: row.created_at,
     payloadJson: row.payload_json,
   };
+}
+
+function mapAuthAccountRow(row: AuthAccountRow): AuthAccount {
+  const recipientPrincipalId = createAccountScopedPrincipal(row.username, "recipient");
+  return {
+    username: row.username,
+    passwordSalt: row.password_salt,
+    passwordHash: row.password_hash,
+    transferorPrincipalId: row.transferor_principal_id,
+    adminPrincipalId: row.admin_principal_id,
+    recipientPrincipalId,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function mapAuthSessionRow(row: AuthSessionRow): AuthSession {
+  return {
+    sessionId: row.session_id,
+    username: row.username,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    lastSeenAt: row.last_seen_at,
+    revokedAt: row.revoked_at ?? undefined,
+  };
+}
+
+function hashPassword(password: string, salt: string) {
+  return scryptSync(password, salt, 64).toString("base64url");
 }

@@ -11,23 +11,37 @@ import {
   createSharedDatabase,
   type IdentityPasskeyCredential,
 } from "@safr-x-atp-demo/storage";
-import {
-  DEMO_PRINCIPALS,
-  assertValidIcpPrincipal,
-} from "@safr-x-atp-demo/protocol";
+import { assertEnglishAccountHandle, assertValidIcpPrincipal } from "@safr-x-atp-demo/protocol";
 
 const port = Number(process.env.PORT ?? 4105);
 const rpName = process.env.WEBAUTHN_RP_NAME ?? "SAFR x ATP Demo";
 const rpID = process.env.WEBAUTHN_RP_ID ?? "localhost";
 const expectedOrigin = process.env.WEBAUTHN_ORIGIN ?? "http://localhost:4173";
+const bankServiceBaseUrl = process.env.BANK_SERVICE_URL ?? "http://localhost:4104";
 const repository = new IdentityRepository(createSharedDatabase());
+const sessionCookieName = "safr_demo_session";
+const sessionLifetimeMs = 7 * 24 * 60 * 60 * 1000;
 
-function sendJson(response: import("node:http").ServerResponse, status: number, body: unknown) {
-  response.statusCode = status;
-  response.setHeader("Content-Type", "application/json; charset=utf-8");
-  response.setHeader("Access-Control-Allow-Origin", "*");
+function setCorsHeaders(response: import("node:http").ServerResponse) {
+  response.setHeader("Access-Control-Allow-Origin", expectedOrigin);
+  response.setHeader("Access-Control-Allow-Credentials", "true");
   response.setHeader("Access-Control-Allow-Headers", "Content-Type");
   response.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  response.setHeader("Vary", "Origin");
+}
+
+function sendJson(
+  response: import("node:http").ServerResponse,
+  status: number,
+  body: unknown,
+  extraHeaders: Record<string, string> = {},
+) {
+  response.statusCode = status;
+  response.setHeader("Content-Type", "application/json; charset=utf-8");
+  setCorsHeaders(response);
+  for (const [key, value] of Object.entries(extraHeaders)) {
+    response.setHeader(key, value);
+  }
   response.end(JSON.stringify(body, null, 2));
 }
 
@@ -42,33 +56,6 @@ async function readJson(request: import("node:http").IncomingMessage): Promise<R
   return JSON.parse(Buffer.concat(chunks).toString("utf-8")) as Record<string, unknown>;
 }
 
-function getPrincipalMetadata(principalId: string, role: string) {
-  if (principalId === DEMO_PRINCIPALS.transferor) {
-    return {
-      principalId,
-      role,
-      username: "alice.transferor",
-      displayName: "Alice Transferor",
-    };
-  }
-
-  if (principalId === DEMO_PRINCIPALS.admin) {
-    return {
-      principalId,
-      role,
-      username: "zoe.admin",
-      displayName: "Zoe Administrator",
-    };
-  }
-
-  return {
-    principalId,
-    role,
-    username: principalId,
-    displayName: principalId,
-  };
-}
-
 function getRequiredString(body: Record<string, unknown>, key: string) {
   const value = body[key];
   if (typeof value !== "string" || value.length === 0) {
@@ -79,6 +66,20 @@ function getRequiredString(body: Record<string, unknown>, key: string) {
 
 function getRequiredPrincipalId(body: Record<string, unknown>, key = "principalId") {
   return assertValidIcpPrincipal(getRequiredString(body, key), key);
+}
+
+function serializeAccount(account: {
+  username: string;
+  transferorPrincipalId: string;
+  adminPrincipalId: string;
+  recipientPrincipalId: string;
+}) {
+  return {
+    username: account.username,
+    transferorPrincipalId: account.transferorPrincipalId,
+    adminPrincipalId: account.adminPrincipalId,
+    recipientPrincipalId: account.recipientPrincipalId,
+  };
 }
 
 function serializeStatus(principalId: string) {
@@ -102,9 +103,107 @@ function serializeStatus(principalId: string) {
           createdAt: status.latestAuthenticationProof.createdAt,
           credentialId: status.latestAuthenticationProof.credentialId,
           verified: status.latestAuthenticationProof.verified,
+          proofType: status.latestAuthenticationProof.proofType,
+        }
+      : null,
+    latestVerifiedProof: status.latestVerifiedProof
+      ? {
+          proofId: status.latestVerifiedProof.proofId,
+          createdAt: status.latestVerifiedProof.createdAt,
+          credentialId: status.latestVerifiedProof.credentialId,
+          verified: status.latestVerifiedProof.verified,
+          proofType: status.latestVerifiedProof.proofType,
         }
       : null,
   };
+}
+
+async function bootstrapAccountSpace(account: {
+  transferorPrincipalId: string;
+  recipientPrincipalId: string;
+}) {
+  const bootstrapRequests = [
+    {
+      ownerId: account.transferorPrincipalId,
+      ownerRole: "transferor" as const,
+      currency: "USD",
+    },
+    {
+      ownerId: account.recipientPrincipalId,
+      ownerRole: "recipient" as const,
+      currency: "USD",
+    },
+  ];
+
+  for (const payload of bootstrapRequests) {
+    const response = await fetch(`${bankServiceBaseUrl}/accounts/bootstrap`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      const body = (await response.json()) as { error?: string };
+      throw new Error(body.error ?? `Failed to bootstrap bank account: ${response.status}`);
+    }
+  }
+}
+
+function parseCookieHeader(header: string | undefined) {
+  const entries = new Map<string, string>();
+  if (!header) {
+    return entries;
+  }
+
+  for (const part of header.split(";")) {
+    const [name, ...rest] = part.trim().split("=");
+    if (!name) {
+      continue;
+    }
+    entries.set(name, rest.join("="));
+  }
+
+  return entries;
+}
+
+function getSessionId(request: import("node:http").IncomingMessage) {
+  return parseCookieHeader(request.headers.cookie).get(sessionCookieName);
+}
+
+function buildSessionCookie(sessionId: string, maxAgeMs = sessionLifetimeMs) {
+  const maxAgeSeconds = Math.max(0, Math.floor(maxAgeMs / 1000));
+  return `${sessionCookieName}=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}`;
+}
+
+function clearSessionCookie() {
+  return `${sessionCookieName}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
+}
+
+function getActiveAccountFromRequest(request: import("node:http").IncomingMessage) {
+  const sessionId = getSessionId(request);
+  if (!sessionId) {
+    return undefined;
+  }
+  return repository.getAccountBySession(sessionId);
+}
+
+function requireActiveAccount(request: import("node:http").IncomingMessage) {
+  const account = getActiveAccountFromRequest(request);
+  if (!account) {
+    throw new Error("Authentication required");
+  }
+  return account;
+}
+
+function assertPrincipalForAccount(
+  account: { transferorPrincipalId: string; adminPrincipalId: string },
+  principalId: string,
+  role: "transferor" | "administrator",
+) {
+  const expectedPrincipalId = role === "transferor" ? account.transferorPrincipalId : account.adminPrincipalId;
+  if (expectedPrincipalId !== principalId) {
+    throw new Error("Principal does not belong to the current account");
+  }
 }
 
 function credentialForVerification(credential: IdentityPasskeyCredential) {
@@ -192,9 +291,7 @@ const server = createServer(async (request, response) => {
 
   if (request.method === "OPTIONS") {
     response.statusCode = 204;
-    response.setHeader("Access-Control-Allow-Origin", "*");
-    response.setHeader("Access-Control-Allow-Headers", "Content-Type");
-    response.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    setCorsHeaders(response);
     response.end();
     return;
   }
@@ -210,8 +307,101 @@ const server = createServer(async (request, response) => {
     return;
   }
 
+  if (request.method === "POST" && url.pathname === "/auth/register") {
+    try {
+      const body = await readJson(request);
+      const username = assertEnglishAccountHandle(getRequiredString(body, "username"));
+      const password = getRequiredString(body, "password");
+      const account = repository.createAuthAccount({ username, password });
+      await bootstrapAccountSpace(account);
+      const session = repository.createSession(account.username, sessionLifetimeMs / (60 * 1000));
+      sendJson(
+        response,
+        200,
+        {
+          ok: true,
+          account: serializeAccount(account),
+        },
+        {
+          "Set-Cookie": buildSessionCookie(session.sessionId),
+        },
+      );
+    } catch (error) {
+      sendJson(response, 400, {
+        error: error instanceof Error ? error.message : "Failed to register account",
+      });
+    }
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/auth/login") {
+    try {
+      const body = await readJson(request);
+      const username = assertEnglishAccountHandle(getRequiredString(body, "username"));
+      const password = getRequiredString(body, "password");
+      const account = repository.verifyAuthAccount(username, password);
+      if (!account) {
+        throw new Error("Invalid username or password");
+      }
+      await bootstrapAccountSpace(account);
+      const session = repository.createSession(account.username, sessionLifetimeMs / (60 * 1000));
+      sendJson(
+        response,
+        200,
+        {
+          ok: true,
+          account: serializeAccount(account),
+        },
+        {
+          "Set-Cookie": buildSessionCookie(session.sessionId),
+        },
+      );
+    } catch (error) {
+      sendJson(response, 400, {
+        error: error instanceof Error ? error.message : "Failed to log in",
+      });
+    }
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/auth/me") {
+    const account = getActiveAccountFromRequest(request);
+    if (!account) {
+      sendJson(response, 200, { authenticated: false, account: null });
+      return;
+    }
+
+    const sessionId = getSessionId(request);
+    if (sessionId) {
+      repository.touchSession(sessionId);
+    }
+
+    sendJson(response, 200, {
+      authenticated: true,
+      account: serializeAccount(account),
+    });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/auth/logout") {
+    const sessionId = getSessionId(request);
+    if (sessionId) {
+      repository.revokeSession(sessionId);
+    }
+    sendJson(
+      response,
+      200,
+      { ok: true },
+      {
+        "Set-Cookie": clearSessionCookie(),
+      },
+    );
+    return;
+  }
+
   if (request.method === "GET" && url.pathname.startsWith("/principals/") && url.pathname.endsWith("/passkey-status")) {
     try {
+      requireActiveAccount(request);
       const principalId = assertValidIcpPrincipal(
         url.pathname.replace("/principals/", "").replace("/passkey-status", ""),
         "principalId",
@@ -230,7 +420,12 @@ const server = createServer(async (request, response) => {
       const body = await readJson(request);
       const principalId = getRequiredPrincipalId(body);
       const role = getRequiredString(body, "role");
-      const principal = repository.ensurePrincipal(getPrincipalMetadata(principalId, role));
+      const account = requireActiveAccount(request);
+      assertPrincipalForAccount(account, principalId, role === "transferor" ? "transferor" : "administrator");
+      const principal = repository.getPrincipal(principalId);
+      if (!principal) {
+        throw new Error("Principal not found for current account");
+      }
       const existingCredentials = repository.listCredentials(principalId);
 
       const options = await generateRegistrationOptions({
@@ -273,6 +468,8 @@ const server = createServer(async (request, response) => {
       const body = await readJson(request);
       const principalId = getRequiredPrincipalId(body);
       const role = getRequiredString(body, "role");
+      const account = requireActiveAccount(request);
+      assertPrincipalForAccount(account, principalId, role === "transferor" ? "transferor" : "administrator");
       const webauthnResponse = body.response;
       const challenge = repository.getLatestActiveChallenge(principalId, "registration");
       if (!challenge) {
@@ -341,6 +538,9 @@ const server = createServer(async (request, response) => {
     try {
       const body = await readJson(request);
       const principalId = getRequiredPrincipalId(body);
+      const role = getRequiredString(body, "role");
+      const account = requireActiveAccount(request);
+      assertPrincipalForAccount(account, principalId, role === "transferor" ? "transferor" : "administrator");
       const credentials = repository.listCredentials(principalId);
       if (credentials.length === 0) {
         throw new Error("No registered passkey found for principal");
@@ -380,6 +580,8 @@ const server = createServer(async (request, response) => {
       const body = await readJson(request);
       const principalId = getRequiredPrincipalId(body);
       const role = getRequiredString(body, "role");
+      const account = requireActiveAccount(request);
+      assertPrincipalForAccount(account, principalId, role === "transferor" ? "transferor" : "administrator");
       const webauthnResponse = body.response as Record<string, unknown>;
       const challenge = repository.getLatestActiveChallenge(principalId, "authentication");
       if (!challenge) {
@@ -446,7 +648,7 @@ const server = createServer(async (request, response) => {
       const proofId = getRequiredString(body, "proofId");
       const principalId = getRequiredPrincipalId(body);
       const role = getRequiredString(body, "role");
-      const proofType = getRequiredString(body, "proofType");
+      const proofType = typeof body.proofType === "string" && body.proofType.length > 0 ? body.proofType : null;
       const proof = repository.getVerificationProof(proofId);
       if (!proof) {
         throw new Error("Proof not found");
@@ -454,8 +656,11 @@ const server = createServer(async (request, response) => {
       if (!proof.verified) {
         throw new Error("Proof is not verified");
       }
-      if (proof.principalId !== principalId || proof.role !== role || proof.proofType !== proofType) {
-        throw new Error("Proof does not match principal, role, or proof type");
+      if (proof.principalId !== principalId || proof.role !== role) {
+        throw new Error("Proof does not match principal or role");
+      }
+      if (proofType && proof.proofType !== proofType) {
+        throw new Error("Proof does not match proof type");
       }
 
       sendJson(response, 200, {

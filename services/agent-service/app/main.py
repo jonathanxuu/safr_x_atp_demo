@@ -40,8 +40,8 @@ class EvaluateTransferRequest(BaseModel):
     currency: str
     memo: str
     recipientAccountRef: str
-    recipientId: str = DEMO_PRINCIPALS["recipient"]
-    principalId: str = DEMO_PRINCIPALS["transferor"]
+    recipientId: str
+    principalId: str
     agentId: str = DEMO_AGENT_IDS["transfer"]
     transferorPasskey: dict[str, Any]
 
@@ -53,6 +53,7 @@ class AdminApproveRequest(BaseModel):
     instructionEventId: str
     adminProofRef: str
     adminVerified: bool
+    adminPrincipalId: str
 
 
 class ExecuteTransferRequest(BaseModel):
@@ -80,19 +81,32 @@ async def get_json(url: str) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.get(url)
     if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=f"Failed GET {url}")
+        try:
+            body = response.json()
+        except Exception:
+            body = {"error": response.text}
+        detail = body.get("error") or body.get("detail") or "Request failed"
+        raise HTTPException(status_code=response.status_code, detail=detail)
     return response.json()
 
 
-async def validate_identity_proof(*, proof_id: str, principal_id: str, role: str) -> dict[str, Any]:
+async def validate_identity_proof(
+    *,
+    proof_id: str,
+    principal_id: str,
+    role: str,
+    proof_type: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "proofId": proof_id,
+        "principalId": principal_id,
+        "role": role,
+    }
+    if proof_type:
+        payload["proofType"] = proof_type
     return await post_json(
         f"{IDENTITY_SERVICE_URL}/proofs/validate",
-        {
-            "proofId": proof_id,
-            "principalId": principal_id,
-            "role": role,
-            "proofType": "authentication",
-        },
+        payload,
     )
 
 
@@ -283,6 +297,7 @@ async def evaluate_transfer(request: EvaluateTransferRequest) -> dict[str, Any]:
         proof_id=str(request.transferorPasskey["proofRef"]),
         principal_id=request.principalId,
         role="transferor",
+        proof_type="authentication",
     )
 
     instruction_payload = build_instruction_payload(request)
@@ -366,7 +381,7 @@ async def admin_approve(request: AdminApproveRequest) -> dict[str, Any]:
     admin_payload = {
         "id": f"evt_admin_{uuid4().hex}_hash",
         "kind": 105,
-        "ai_id": DEMO_PRINCIPALS["admin"],
+        "ai_id": request.adminPrincipalId,
         "created_at": now_epoch(),
         "tags": [
             ["flow_id", request.flowId],
@@ -374,7 +389,7 @@ async def admin_approve(request: AdminApproveRequest) -> dict[str, Any]:
         ],
         "content": {
             "verifier_record_ref": request.firstVerifierEventId,
-            "admin_id": DEMO_PRINCIPALS["admin"],
+            "admin_id": request.adminPrincipalId,
             "decision": "admin_signed_approval",
             "comment": "Approved by administrator passkey through agent-service",
             "signature_proof": {

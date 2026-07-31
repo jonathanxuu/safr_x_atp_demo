@@ -150,13 +150,13 @@ start_service \
   "mcp-bank" \
   "4104" \
   "http://localhost:4104/health" \
-  "cd '$ROOT_DIR' && npm run dev --workspace @safr-x-atp-demo/mcp-bank"
+  "cd '$ROOT_DIR' && FRONTEND_ORIGIN='http://localhost:4173' npm run dev --workspace @safr-x-atp-demo/mcp-bank"
 
 start_service \
   "identity-service" \
   "4105" \
   "http://localhost:4105/health" \
-  "cd '$ROOT_DIR' && npm run dev --workspace @safr-x-atp-demo/identity-service"
+  "cd '$ROOT_DIR' && WEBAUTHN_ORIGIN='http://localhost:4173' BANK_SERVICE_URL='http://localhost:4104' npm run dev --workspace @safr-x-atp-demo/identity-service"
 
 start_service \
   "agent-service" \

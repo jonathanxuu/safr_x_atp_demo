@@ -418,6 +418,34 @@ const migrations = [
       ON principal_signing_keys (role);
     `,
   },
+  {
+    version: 6,
+    name: "auth_accounts_and_sessions",
+    sql: `
+    CREATE TABLE IF NOT EXISTS auth_accounts (
+      username TEXT PRIMARY KEY,
+      password_salt TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      transferor_principal_id TEXT NOT NULL UNIQUE,
+      admin_principal_id TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+      session_id TEXT PRIMARY KEY,
+      username TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      revoked_at TEXT,
+      FOREIGN KEY (username) REFERENCES auth_accounts(username) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_auth_sessions_username
+      ON auth_sessions (username, created_at DESC);
+    `,
+  },
 ];
 
 function applyMigrations(db: DatabaseSync) {
@@ -720,6 +748,42 @@ export class BankRepository {
     this.seedDefaults();
   }
 
+  ensureAccount(input: {
+    ownerId: string;
+    ownerRole: "transferor" | "recipient";
+    currency: string;
+    availableBalance?: number;
+  }): BankAccount {
+    const existing = this.getAccountByOwner(input.ownerId, input.ownerRole, input.currency);
+    if (existing) {
+      return existing;
+    }
+
+    const account: BankAccount = {
+      accountId: createDeterministicBankAccountId(input.ownerId, input.ownerRole, input.currency),
+      ownerId: input.ownerId,
+      ownerRole: input.ownerRole,
+      currency: input.currency,
+      availableBalance: input.availableBalance ?? (input.ownerRole === "transferor" ? 25000 : 3200),
+    };
+    const now = new Date().toISOString();
+
+    this.db.prepare(`
+      INSERT INTO bank_accounts (
+        account_id, owner_id, owner_role, currency, available_balance, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      account.accountId,
+      account.ownerId,
+      account.ownerRole,
+      account.currency,
+      account.availableBalance,
+      now,
+    );
+
+    return account;
+  }
+
   listAccounts(): BankAccount[] {
     const rows = this.db
       .prepare(`
@@ -738,6 +802,25 @@ export class BankRepository {
     }));
   }
 
+  listAccountsByOwner(ownerId: string): BankAccount[] {
+    const rows = this.db
+      .prepare(`
+        SELECT account_id, owner_id, owner_role, currency, available_balance
+        FROM bank_accounts
+        WHERE owner_id = ?
+        ORDER BY owner_role ASC, currency ASC, account_id ASC
+      `)
+      .all(ownerId) as BankAccountRow[];
+
+    return rows.map((row) => ({
+      accountId: row.account_id,
+      ownerId: row.owner_id,
+      ownerRole: row.owner_role as "transferor" | "recipient",
+      currency: row.currency,
+      availableBalance: row.available_balance,
+    }));
+  }
+
   getAccount(accountId: string): BankAccount | undefined {
     const row = this.db
       .prepare(`
@@ -746,6 +829,29 @@ export class BankRepository {
         WHERE account_id = ?
       `)
       .get(accountId) as BankAccountRow | undefined;
+
+    if (!row) {
+      return undefined;
+    }
+
+    return {
+      accountId: row.account_id,
+      ownerId: row.owner_id,
+      ownerRole: row.owner_role as "transferor" | "recipient",
+      currency: row.currency,
+      availableBalance: row.available_balance,
+    };
+  }
+
+  getAccountByOwner(ownerId: string, ownerRole: "transferor" | "recipient", currency: string) {
+    const row = this.db
+      .prepare(`
+        SELECT account_id, owner_id, owner_role, currency, available_balance
+        FROM bank_accounts
+        WHERE owner_id = ? AND owner_role = ? AND currency = ?
+        LIMIT 1
+      `)
+      .get(ownerId, ownerRole, currency) as BankAccountRow | undefined;
 
     if (!row) {
       return undefined;
@@ -1292,4 +1398,12 @@ function mapPrincipalSigningKeyRow(row: PrincipalSigningKeyRow): PrincipalSignin
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function createDeterministicBankAccountId(ownerId: string, ownerRole: "transferor" | "recipient", currency: string) {
+  const digest = createHash("sha256")
+    .update(`${ownerId}:${ownerRole}:${currency}:bank_account:v1`)
+    .digest("hex")
+    .slice(0, 16);
+  return `acct_${ownerRole}_${currency.toLowerCase()}_${digest}`;
 }

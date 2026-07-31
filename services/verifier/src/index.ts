@@ -22,6 +22,7 @@ const port = Number(process.env.PORT ?? 4103);
 const eventServiceBaseUrl = process.env.EVENT_SERVICE_URL ?? "http://localhost:4101";
 const archiveServiceBaseUrl = process.env.ARCHIVE_SERVICE_URL ?? "http://localhost:4102";
 const identityServiceBaseUrl = process.env.IDENTITY_SERVICE_URL ?? "http://localhost:4105";
+const mcpBankBaseUrl = process.env.MCP_BANK_URL ?? "http://localhost:4104";
 const agentPublicKeyPath =
   process.env.AGENT_PUBLIC_KEY_PATH ??
   "/Users/xyz/Documents/github/safr_x_atp_demo/services/agent-service/keys/agent_ed25519_public.pem";
@@ -53,6 +54,14 @@ interface EventServiceRecord {
   aiId: string;
   createdAt: number;
   payload: BaseEventEnvelope<UnknownContent>;
+}
+
+interface BankAccountRecord {
+  accountId: string;
+  ownerId: string;
+  ownerRole: string;
+  currency: string;
+  availableBalance: number;
 }
 
 interface CurrentPolicyResponse {
@@ -224,7 +233,7 @@ async function validateProof(input: {
   proofId: string;
   principalId: string;
   role: string;
-  proofType: "authentication";
+  proofType?: "authentication" | "registration";
 }) {
   const response = await fetch(`${identityServiceBaseUrl}/proofs/validate`, {
     method: "POST",
@@ -291,6 +300,26 @@ function extractRecipientAccountRef(envelope: BaseEventEnvelope<UnknownContent>)
     throw new Error("Envelope recipient account is missing");
   }
   return recipientAccountRef;
+}
+
+function extractInstructionRecipientId(instructionRecord: EventServiceRecord): string {
+  const recipientId = instructionRecord.payload.content.recipient_id;
+  if (typeof recipientId !== "string" || recipientId.length === 0) {
+    throw new Error("Instruction recipient_id is missing");
+  }
+  return recipientId;
+}
+
+async function fetchBankAccount(accountId: string): Promise<BankAccountRecord | null> {
+  const response = await fetch(`${mcpBankBaseUrl}/accounts/${accountId}`);
+  if (response.status === 404) {
+    return null;
+  }
+  if (!response.ok) {
+    throw new Error(`Failed to load bank account ${accountId}: ${response.status}`);
+  }
+  const body = (await response.json()) as { account?: BankAccountRecord };
+  return body.account ?? null;
 }
 
 function canonicalStringify(value: unknown): string {
@@ -720,6 +749,7 @@ async function buildFirstDecision(
   const amount = extractAmount(envelopeRecord.payload);
   const currency = extractCurrency(envelopeRecord.payload);
   const recipientAccountRef = extractRecipientAccountRef(envelopeRecord.payload);
+  const recipientId = extractInstructionRecipientId(instructionRecord);
   const numericAmount = amountToNumber(amount);
   const activeBundle = policyRepository.getActiveBundle();
   const signatureProof = instructionRecord.payload.content.signature_proof as SignatureProofContent | undefined;
@@ -891,13 +921,37 @@ async function buildFirstDecision(
     });
   }
 
-  if (policy.recipientAllowlistRequired && recipientAccountRef !== "acct_recipient_bob_001") {
+  let recipientAccount: BankAccountRecord | null = null;
+  try {
+    recipientAccount = await fetchBankAccount(recipientAccountRef);
+  } catch (error) {
+    return buildRejectDecision({
+      flowId,
+      envelopeRecord,
+      instructionRecord,
+      reasonCode: "recipient_account_lookup_failed",
+      reasonMessage:
+        error instanceof Error ? error.message : "Recipient account lookup failed",
+      currency,
+    });
+  }
+
+  const resolvedRecipientAccount = recipientAccount;
+  const recipientAccountAllowed =
+    resolvedRecipientAccount !== null &&
+    resolvedRecipientAccount.ownerId === recipientId &&
+    resolvedRecipientAccount.ownerRole === "recipient";
+  const recipientAllowlistReasonMessage = resolvedRecipientAccount
+    ? `Recipient account ${recipientAccountRef} belongs to ${resolvedRecipientAccount.ownerId}, not the current recipient principal`
+    : `Recipient account ${recipientAccountRef} is not in the allowlist`;
+
+  if (policy.recipientAllowlistRequired && !recipientAccountAllowed) {
     return buildRejectDecision({
       flowId,
       envelopeRecord,
       instructionRecord,
       reasonCode: "recipient_not_allowlisted",
-      reasonMessage: `Recipient account ${recipientAccountRef} is not in the allowlist`,
+      reasonMessage: recipientAllowlistReasonMessage,
       currency,
     });
   }
@@ -912,7 +966,7 @@ async function buildFirstDecision(
       instruction_nonce_unused: true,
       agent_registered: Boolean(agentSignatureVerification?.agentPrincipal),
       agent_signature_valid: true,
-      recipient_account_resolved: recipientAccountRef === "acct_recipient_bob_001",
+      recipient_account_resolved: recipientAccountAllowed,
       mandate_valid: true,
       envelope_schema_valid: true,
       control_bundle_resolved: true,
@@ -1084,8 +1138,15 @@ const server = createServer(async (request, response) => {
       const currency = url.searchParams.get("currency") ?? "USD";
       sendJson(response, 200, getCurrentPolicy(currency));
     } catch (error) {
+      const currency = url.searchParams.get("currency") ?? "USD";
+      const message =
+        error instanceof Error && error.message.includes("No verifier policy found for currency:")
+          ? `Currency ${currency} is not supported by the active policy bundle`
+          : error instanceof Error
+            ? error.message
+            : "Failed to load current policy";
       sendJson(response, 400, {
-        error: error instanceof Error ? error.message : "Failed to load current policy",
+        error: message,
       });
     }
     return;

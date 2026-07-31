@@ -1,7 +1,10 @@
 :root {
   font-family: "Helvetica Neue", Arial, sans-serif;
   color: #0f172a;
-  background: linear-gradient(180deg, #eef5fb 0%, #f8fbff 100%);
+  background:
+    radial-gradient(circle at top left, rgba(59, 130, 246, 0.16), transparent 34%),
+    radial-gradient(circle at top right, rgba(16, 185, 129, 0.12), transparent 28%),
+    linear-gradient(180deg, #eef5fb 0%, #f8fbff 100%);
 }
 
 * {
@@ -12,10 +15,229 @@ body {
   margin: 0;
 }
 
+body,
+input,
+button,
+select {
+  font-family: inherit;
+}
+
 .page {
   max-width: 1320px;
   margin: 0 auto;
   padding: 32px;
+}
+
+.authShell {
+  position: relative;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  overflow: hidden;
+}
+
+.authBackdrop {
+  position: absolute;
+  inset: auto;
+  border-radius: 999px;
+  filter: blur(20px);
+  opacity: 0.85;
+  pointer-events: none;
+}
+
+.authBackdropOne {
+  top: 8%;
+  left: 10%;
+  width: 260px;
+  height: 260px;
+  background: rgba(59, 130, 246, 0.16);
+}
+
+.authBackdropTwo {
+  right: 8%;
+  bottom: 10%;
+  width: 320px;
+  height: 320px;
+  background: rgba(16, 185, 129, 0.14);
+}
+
+.authCard {
+  position: relative;
+  z-index: 1;
+  width: min(720px, 100%);
+  padding: 32px;
+  border-radius: 30px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid #d9e3f0;
+  box-shadow: 0 28px 80px rgba(15, 23, 42, 0.12);
+  backdrop-filter: blur(16px);
+}
+
+.authBadge {
+  display: inline-flex;
+  align-items: center;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: #e0f2fe;
+  color: #075985;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.authCard h1 {
+  margin: 18px 0 10px;
+  font-size: clamp(34px, 4vw, 56px);
+  line-height: 1.02;
+}
+
+.authCard p {
+  max-width: 58ch;
+  margin: 0 0 20px;
+  color: #475569;
+  line-height: 1.7;
+}
+
+.authField {
+  display: block;
+  margin-bottom: 18px;
+}
+
+.authField span {
+  display: block;
+  margin-bottom: 6px;
+  color: #334155;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.authField input {
+  width: 100%;
+  padding: 14px 16px;
+  border-radius: 16px;
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  font-size: 16px;
+}
+
+.authStrength {
+  margin-top: -4px;
+  margin-bottom: 18px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+}
+
+.authStrengthHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+  color: #334155;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.authStrengthLabel {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.authStrengthBar {
+  height: 10px;
+  border-radius: 999px;
+  background: #e2e8f0;
+  overflow: hidden;
+}
+
+.authStrengthFill {
+  height: 100%;
+  border-radius: inherit;
+  transition: width 180ms ease, background-color 180ms ease;
+}
+
+.authStrengthFill.strength-weak {
+  background: linear-gradient(90deg, #ef4444, #f97316);
+}
+
+.authStrengthFill.strength-fair {
+  background: linear-gradient(90deg, #f59e0b, #eab308);
+}
+
+.authStrengthFill.strength-good {
+  background: linear-gradient(90deg, #0ea5e9, #22c55e);
+}
+
+.authStrengthFill.strength-strong {
+  background: linear-gradient(90deg, #16a34a, #14b8a6);
+}
+
+.authStrengthCopy {
+  margin: 10px 0 8px;
+  color: #475569;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.authStrengthChecks {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 14px;
+  margin: 0;
+  padding-left: 18px;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.authActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.authHint {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  margin-top: 16px;
+  color: #64748b;
+  font-size: 13px;
+}
+
+.authPreview {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 20px;
+}
+
+.authPreview > div {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+}
+
+.authPreview span {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.authPreview code {
+  word-break: break-word;
+  color: #0f172a;
 }
 
 .hero {
@@ -36,6 +258,13 @@ body {
   max-width: 760px;
   color: #475569;
   line-height: 1.6;
+}
+
+.heroActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: flex-end;
 }
 
 .roles,
@@ -169,6 +398,11 @@ body {
   word-break: break-word;
 }
 
+.passkeyReadyBadge {
+  margin: 0;
+  align-self: flex-start;
+}
+
 .passkeyMetaGrid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -280,6 +514,83 @@ button.danger {
   background: #fff1f2;
   border: 1px solid #fecdd3;
   color: #be123c;
+}
+
+.flowStatusBanner {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 18px;
+  padding: 14px 16px;
+  border-radius: 16px;
+  border: 1px solid transparent;
+}
+
+.flowStatusBanner strong {
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.flowStatusBanner span {
+  font-size: 18px;
+  font-weight: 800;
+}
+
+.statusTone-success {
+  background: #ecfdf5;
+  border-color: #86efac;
+  color: #166534;
+}
+
+.statusTone-error {
+  background: #fff1f2;
+  border-color: #fecdd3;
+  color: #be123c;
+}
+
+.statusTone-info {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+  color: #1d4ed8;
+}
+
+.statusTone-processing {
+  background:
+    linear-gradient(135deg, rgba(14, 165, 233, 0.16), rgba(20, 184, 166, 0.16)),
+    #effafc;
+  border-color: #67e8f9;
+  color: #0f766e;
+  box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.08), 0 14px 34px rgba(13, 148, 136, 0.12);
+  animation: statusProcessingPulse 1.3s ease-in-out infinite;
+}
+
+@keyframes statusProcessingPulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.08), 0 14px 34px rgba(13, 148, 136, 0.12);
+    transform: translateY(0);
+  }
+  50% {
+    box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.18), 0 16px 42px rgba(13, 148, 136, 0.2);
+    transform: translateY(-1px);
+  }
+}
+
+.flowFieldHint,
+.flowFieldError {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.flowFieldHint {
+  color: #64748b;
+}
+
+.flowFieldError {
+  color: #b91c1c;
+  font-weight: 700;
 }
 
 .rejectDetails {
@@ -456,6 +767,190 @@ button.danger {
   display: flex;
   flex-direction: column;
   gap: 20px;
+}
+
+.flowPolicyBanner {
+  display: flex;
+  justify-content: space-between;
+  align-items: stretch;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px solid #dbe7f5;
+  background:
+    radial-gradient(circle at top left, rgba(59, 130, 246, 0.08), transparent 28%),
+    linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+}
+
+.flowPolicyBannerReady {
+  border-color: #bbf7d0;
+  background:
+    radial-gradient(circle at top left, rgba(34, 197, 94, 0.1), transparent 28%),
+    linear-gradient(180deg, #ffffff 0%, #f0fdf4 100%);
+}
+
+.flowPolicyBannerWarn {
+  border-color: #bfdbfe;
+  background:
+    radial-gradient(circle at top left, rgba(96, 165, 250, 0.12), transparent 28%),
+    linear-gradient(180deg, #ffffff 0%, #eff6ff 100%);
+}
+
+.flowPolicyBannerCopy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 420px;
+}
+
+.flowPolicyBannerCopy span,
+.flowPolicyBannerMeta span {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #64748b;
+}
+
+.flowPolicyBannerCopy strong {
+  font-size: 16px;
+  line-height: 1.18;
+  color: #0f172a;
+}
+
+.flowPolicyBannerCopy small {
+  max-width: 900px;
+  font-size: 13px;
+  color: #475569;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.flowPolicyBannerMeta {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.flowPolicyBannerMetaCompact {
+  flex: 0 0 auto;
+  justify-content: flex-end;
+  align-content: center;
+}
+
+.flowPolicyBannerMeta > div {
+  min-width: 120px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.82);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.flowPolicyBannerMeta strong {
+  font-size: 14px;
+  line-height: 1.2;
+  color: #0f172a;
+}
+
+.flowPolicyRulesCard {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1 1 360px;
+  min-width: 0;
+  padding: 14px 16px;
+  border-radius: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  background: rgba(255, 255, 255, 0.82);
+}
+
+.flowPolicyRulesCardReady {
+  border-color: rgba(34, 197, 94, 0.28);
+  background: rgba(240, 253, 244, 0.94);
+}
+
+.flowPolicyRulesCardWarn {
+  border-color: rgba(96, 165, 250, 0.22);
+  background: rgba(239, 246, 255, 0.94);
+}
+
+.flowPolicyRulesHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.flowPolicyRulesHeader span {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #64748b;
+}
+
+.flowPolicyRulesHeader strong {
+  font-size: 15px;
+  color: #0f172a;
+  text-align: right;
+}
+
+.flowPolicyRulesGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.flowPolicyRulesGrid > div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.82);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.flowPolicyRulesGrid span,
+.flowPolicyRulesGrid strong {
+  word-break: break-word;
+}
+
+.flowPolicyRulesGrid span {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #64748b;
+}
+
+.flowPolicyRulesGrid strong {
+  font-size: 15px;
+  color: #0f172a;
+}
+
+.flowPolicyRulesFallback {
+  margin: 0;
+  color: #475569;
+  line-height: 1.55;
+}
+
+.flowStaticValue {
+  display: flex;
+  align-items: center;
+  min-height: 46px;
+  padding: 0 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(255, 255, 255, 0.88);
+  color: #0f172a;
+  font-size: 15px;
+  font-weight: 600;
 }
 
 .flowCommandField {
@@ -993,6 +1488,71 @@ button.danger {
   gap: 10px;
 }
 
+.instructionComposerStatus {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.instructionComposerActionColumn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 12px;
+  margin-left: auto;
+  max-width: 420px;
+}
+
+.instructionThresholdNotice {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  border: 1px solid #c7ddff;
+  background: linear-gradient(180deg, #f4f8ff 0%, #eaf2ff 100%);
+  color: #1e3a8a;
+  box-shadow: 0 8px 22px rgba(37, 99, 235, 0.08);
+  text-align: left;
+}
+
+.instructionThresholdNoticeLabel {
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #2563eb;
+}
+
+.instructionThresholdNotice strong {
+  font-size: 14px;
+  line-height: 1.5;
+  font-weight: 700;
+}
+
+.instructionComposerActionColumn .actions button:disabled {
+  opacity: 1;
+  background: linear-gradient(135deg, #0f766e, #14b8a6);
+  box-shadow: 0 10px 24px rgba(13, 148, 136, 0.16);
+  animation: submitButtonPulse 1.2s ease-in-out infinite;
+}
+
+@keyframes submitButtonPulse {
+  0%,
+  100% {
+    transform: translateY(0);
+    filter: saturate(1);
+  }
+  50% {
+    transform: translateY(-1px);
+    filter: saturate(1.08);
+  }
+}
+
 .relayArchiveRow {
   display: flex;
   align-items: center;
@@ -1327,6 +1887,10 @@ button.danger {
 
 .flowModalClose {
   background: #0f172a;
+}
+
+.flowModalSecondaryAction {
+  background: linear-gradient(180deg, #2563eb 0%, #1d4ed8 100%);
 }
 
 .flowModalMeta {
@@ -2087,6 +2651,13 @@ button.danger {
   .instructionComposerFooter {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .instructionComposerActionColumn {
+    max-width: none;
+    align-items: stretch;
+    margin-left: 0;
+    width: 100%;
   }
 
   .flowStageLane {

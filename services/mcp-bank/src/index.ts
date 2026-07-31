@@ -7,6 +7,7 @@ import { InMemoryBankStore } from "./store.js";
 const port = Number(process.env.PORT ?? 4104);
 const eventServiceBaseUrl = process.env.EVENT_SERVICE_URL ?? "http://localhost:4101";
 const archiveServiceBaseUrl = process.env.ARCHIVE_SERVICE_URL ?? "http://localhost:4102";
+const expectedOrigin = process.env.FRONTEND_ORIGIN ?? process.env.WEBAUTHN_ORIGIN ?? "http://localhost:4173";
 const bankStore = new InMemoryBankStore(createSharedDatabase());
 
 interface EventServiceRecord {
@@ -33,9 +34,11 @@ interface TransferTransaction {
 function sendJson(response: import("node:http").ServerResponse, status: number, body: unknown) {
   response.statusCode = status;
   response.setHeader("Content-Type", "application/json; charset=utf-8");
-  response.setHeader("Access-Control-Allow-Origin", "*");
+  response.setHeader("Access-Control-Allow-Origin", expectedOrigin);
+  response.setHeader("Access-Control-Allow-Credentials", "true");
   response.setHeader("Access-Control-Allow-Headers", "Content-Type");
   response.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  response.setHeader("Vary", "Origin");
   response.end(JSON.stringify(body, null, 2));
 }
 
@@ -103,6 +106,11 @@ async function triggerArchive(flowId: string) {
   }
 
   return (await response.json()) as { archive: Record<string, unknown> };
+}
+
+function toNumber(value: unknown, fallback: number) {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 function isExecutableVerifierDecision(record: EventServiceRecord): boolean {
@@ -175,9 +183,11 @@ const server = createServer(async (request, response) => {
 
   if (request.method === "OPTIONS") {
     response.statusCode = 204;
-    response.setHeader("Access-Control-Allow-Origin", "*");
+    response.setHeader("Access-Control-Allow-Origin", expectedOrigin);
+    response.setHeader("Access-Control-Allow-Credentials", "true");
     response.setHeader("Access-Control-Allow-Headers", "Content-Type");
     response.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    response.setHeader("Vary", "Origin");
     response.end();
     return;
   }
@@ -193,6 +203,12 @@ const server = createServer(async (request, response) => {
   }
 
   if (request.method === "GET" && url.pathname === "/accounts") {
+    const ownerId = typeof url.searchParams.get("ownerId") === "string" ? url.searchParams.get("ownerId")! : "";
+    if (ownerId) {
+      sendJson(response, 200, { accounts: bankStore.listAccountsByOwner(ownerId) });
+      return;
+    }
+
     sendJson(response, 200, { accounts: bankStore.listAccounts() });
     return;
   }
@@ -220,6 +236,34 @@ const server = createServer(async (request, response) => {
     } catch (error) {
       sendJson(response, 400, {
         error: error instanceof Error ? error.message : "Failed to reset bank state",
+      });
+    }
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/accounts/bootstrap") {
+    try {
+      const body = await readJson(request);
+      const ownerId = typeof body.ownerId === "string" ? body.ownerId : "";
+      const ownerRole = body.ownerRole === "recipient" ? "recipient" : "transferor";
+      const currency = typeof body.currency === "string" && body.currency ? body.currency : "USD";
+      const availableBalance = toNumber(body.availableBalance, ownerRole === "transferor" ? 25000 : 3200);
+
+      if (!ownerId) {
+        throw new Error("Missing ownerId");
+      }
+
+      const account = bankStore.ensureAccount({
+        ownerId,
+        ownerRole,
+        currency,
+        availableBalance,
+      });
+
+      sendJson(response, 200, { account });
+    } catch (error) {
+      sendJson(response, 400, {
+        error: error instanceof Error ? error.message : "Failed to bootstrap account",
       });
     }
     return;

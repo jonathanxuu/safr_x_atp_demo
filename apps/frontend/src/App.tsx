@@ -1,6 +1,6 @@
 import { startAuthentication, startRegistration } from "@simplewebauthn/browser";
 import { useEffect, useState } from "react";
-import { DEMO_AGENT_IDS, DEMO_PRINCIPALS } from "@safr-x-atp-demo/protocol";
+import { DEMO_AGENT_IDS, DEMO_PRINCIPALS, assertEnglishAccountHandle } from "@safr-x-atp-demo/protocol";
 
 type Account = {
   accountId: string;
@@ -87,25 +87,16 @@ type PasskeyState = {
   verified: boolean;
   credentialId: string;
   publicKeyRef: string;
-  challenge: string;
   registeredAt: string;
   proofRef: string;
   lastVerifiedAt: string;
+  proofType: string;
   deviceType: string;
   backedUp: boolean | null;
   rpId: string;
   lastUsedAt: string;
   counter: number | null;
   transports: string[];
-  authDebug: null | {
-    challenge: string;
-    rpId?: string;
-    userVerification?: string;
-    allowCredentials: Array<{
-      id: string;
-      transports?: string[];
-    }>;
-  };
 };
 
 type AgentTrace = {
@@ -131,10 +122,6 @@ type AgentTrace = {
     args?: Record<string, string>;
   }>;
 };
-
-type DemoPasskeyPrincipal =
-  | (typeof DEMO_PRINCIPALS)["transferor"]
-  | (typeof DEMO_PRINCIPALS)["admin"];
 
 type FlowStageId =
   | "instruction"
@@ -169,12 +156,168 @@ const ARCHIVE_SERVICE_URL = "http://localhost:4102";
 const IDENTITY_SERVICE_URL = "http://localhost:4105";
 const AGENT_SERVICE_URL = "http://localhost:4106";
 
+type ActiveAccount = {
+  username: string;
+  transferorPrincipalId: string;
+  adminPrincipalId: string;
+  recipientPrincipalId: string;
+};
+
+type AuthenticatePasskeyResult = {
+  proofId: string;
+  credentialId: string;
+};
+
+type PasswordStrength = {
+  score: number;
+  label: "Too weak" | "Almost there" | "Meets requirements";
+  description: string;
+  checks: string[];
+};
+
+async function fetchIdentity(path: string, init: RequestInit = {}) {
+  return fetch(`${IDENTITY_SERVICE_URL}${path}`, {
+    ...init,
+    credentials: "include",
+    headers: {
+      "Content-Type": "application/json",
+      ...(init.headers ?? {}),
+    },
+  });
+}
+
+function evaluatePasswordStrength(password: string): PasswordStrength {
+  const trimmedPassword = password.trim();
+
+  const checks = [
+    {
+      passed: trimmedPassword.length >= 8,
+      label: "At least 8 characters",
+    },
+    {
+      passed: /\d/.test(trimmedPassword),
+      label: "Includes a number",
+    },
+  ];
+
+  const score = checks.filter((check) => check.passed).length;
+  const label: PasswordStrength["label"] =
+    score < 2 ? (score === 0 ? "Too weak" : "Almost there") : "Meets requirements";
+  const description =
+    score >= 2 ? "This password meets the sign-up rule." : "Use 8+ characters and add at least one number.";
+
+  return {
+    score,
+    label,
+    description,
+    checks: checks.map((check) => `${check.passed ? "✓" : "·"} ${check.label}`),
+  };
+}
+
+function getAppStatusTone(status: string, busy = false) {
+  if (busy) {
+    return "processing";
+  }
+
+  const normalized = status.trim().toLowerCase();
+  if (
+    normalized.includes("failed") ||
+    normalized.includes("error") ||
+    normalized.includes("unauthorized") ||
+    normalized.includes("missing") ||
+    normalized.includes("invalid") ||
+    normalized.includes("not found") ||
+    normalized.includes("blocked")
+  ) {
+    return "error";
+  }
+
+  if (
+    normalized.includes("registered") ||
+    normalized.includes("logged in") ||
+    normalized.includes("executed") ||
+    normalized.includes("reset") ||
+    normalized.includes("ready") ||
+    normalized.includes("approved") ||
+    normalized.includes("signed")
+  ) {
+    return "success";
+  }
+
+  return "info";
+}
+
+function sanitizeAmountInput(value: string) {
+  const stripped = value.replace(/[^\d.]/g, "");
+  const firstDotIndex = stripped.indexOf(".");
+  if (firstDotIndex === -1) {
+    return stripped;
+  }
+
+  const wholePart = stripped.slice(0, firstDotIndex) || "0";
+  const fractionPart = stripped
+    .slice(firstDotIndex + 1)
+    .replace(/\./g, "")
+    .slice(0, 2);
+
+  return `${wholePart}.${fractionPart}`;
+}
+
+function normalizeAmountInput(value: string) {
+  const sanitized = sanitizeAmountInput(value);
+  if (!sanitized) {
+    return "";
+  }
+
+  const parsed = Number(sanitized);
+  if (!Number.isFinite(parsed)) {
+    return "";
+  }
+
+  return parsed.toFixed(2);
+}
+
+function getAmountValidationMessage(value: string, availableBalance: number | null) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "Enter an amount";
+  }
+
+  const sanitized = sanitizeAmountInput(trimmed);
+  if (!sanitized) {
+    return "Amount must be a valid number";
+  }
+
+  if (!/^\d+(\.\d{0,2})?$/.test(sanitized)) {
+    return "Amount can only contain digits and up to two decimal places";
+  }
+
+  const parsed = Number(sanitized);
+  if (!Number.isFinite(parsed)) {
+    return "Amount must be a valid number";
+  }
+  if (parsed < 0) {
+    return "Amount cannot be negative";
+  }
+  if (availableBalance !== null && parsed > availableBalance) {
+    return `Amount cannot exceed your available balance of USD ${availableBalance.toFixed(2)}`;
+  }
+
+  return "";
+}
+
 export function App() {
+  const [authReady, setAuthReady] = useState(false);
+  const [activeAccount, setActiveAccount] = useState<ActiveAccount | null>(null);
+  const [accountUsernameInput, setAccountUsernameInput] = useState("");
+  const [accountPasswordInput, setAccountPasswordInput] = useState("");
+  const [authError, setAuthError] = useState("");
   const [flowId, setFlowId] = useState(() => `flow_demo_${Date.now()}`);
   const [amount, setAmount] = useState("");
-  const [currency, setCurrency] = useState("");
+  const [currency, setCurrency] = useState("USD");
   const [memo, setMemo] = useState("");
   const [recipientAccountRef, setRecipientAccountRef] = useState("");
+  const [amountError, setAmountError] = useState("");
   const [passkeyTransferor, setPasskeyTransferor] = useState<PasskeyState>(createEmptyPasskeyState);
   const [passkeyAdmin, setPasskeyAdmin] = useState<PasskeyState>(createEmptyPasskeyState);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -182,18 +325,35 @@ export function App() {
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [archiveRecords, setArchiveRecords] = useState<ArchiveRecord[]>([]);
   const [policyView, setPolicyView] = useState<VerifierPolicyView | null>(null);
+  const [policyNotice, setPolicyNotice] = useState("");
   const [lastVerifierEventId, setLastVerifierEventId] = useState("");
   const [agentTrace, setAgentTrace] = useState<AgentTrace | null>(null);
   const [status, setStatus] = useState("Ready");
+  const [instructionSubmitBusy, setInstructionSubmitBusy] = useState(false);
   const [selectedStageId, setSelectedStageId] = useState<FlowStageId | null>(null);
   const [spotlightStageId, setSpotlightStageId] = useState<FlowStageId>("instruction");
   const [actionPulseStageId, setActionPulseStageId] = useState<FlowStageId | null>(null);
   const [instructionComposerOpen, setInstructionComposerOpen] = useState(false);
+  const passwordStrength = evaluatePasswordStrength(accountPasswordInput);
 
-  const transferorAccount = accounts.find((account) => account.ownerRole === "transferor");
-  const recipientAccount = accounts.find((account) => account.ownerRole === "recipient");
+  const transferorPrincipalId = activeAccount?.transferorPrincipalId ?? DEMO_PRINCIPALS.transferor;
+  const adminPrincipalId = activeAccount?.adminPrincipalId ?? DEMO_PRINCIPALS.admin;
+  const recipientPrincipalId = activeAccount?.recipientPrincipalId ?? DEMO_PRINCIPALS.recipient;
+  const activeUsername = activeAccount?.username ?? "";
+  const activeAccountLabel = activeUsername || "demo";
+
+  const transferorAccount = accounts.find(
+    (account) => account.ownerId === transferorPrincipalId && account.ownerRole === "transferor",
+  );
+  const recipientAccount = accounts.find(
+    (account) => account.ownerId === recipientPrincipalId && account.ownerRole === "recipient",
+  );
   const threshold = policyView?.policy.adminReviewAtOrAbove ?? 1000;
-  const requiresAdmin = Number(amount) >= threshold;
+  const transferorAvailableBalance = transferorAccount?.availableBalance ?? null;
+  const normalizedAmount = normalizeAmountInput(amount);
+  const amountValidationMessage = getAmountValidationMessage(amount, transferorAvailableBalance);
+  const parsedAmount = normalizedAmount ? Number(normalizedAmount) : Number.NaN;
+  const requiresAdmin = Number.isFinite(parsedAmount) && parsedAmount >= threshold;
   const instructionEvent = events.find((event) => event.kind === 101);
   const envelopeEvent = events.find((event) => event.kind === 102);
   const firstVerifierEvent = events.find(
@@ -204,6 +364,9 @@ export function App() {
   const rejectEvent = events.find((event) => event.kind === 108);
   const executionEvent = events.find((event) => event.kind === 109);
   const latestArchiveRecord = archiveRecords.at(-1);
+  const policySummary = policyView
+    ? `Bundle ${policyView.bundle.bundleId} · ${policyView.policy.policyName} · Auto below ${policyView.policy.currency} ${policyView.policy.autoExecuteBelow.toFixed(2)} · Admin at ${policyView.policy.adminReviewAtOrAbove.toFixed(2)}`
+    : policyNotice || "USD policy is loading.";
   const canExecute = Boolean(
     lastVerifierEventId && (!requiresAdmin ? firstVerifierEvent?.kind === 103 : reverifyEvent),
   );
@@ -257,6 +420,45 @@ export function App() {
     : null;
 
   useEffect(() => {
+    let cancelled = false;
+
+    async function loadSessionAccount() {
+      try {
+        const response = await fetchIdentity("/auth/me", { method: "GET" });
+        if (!response.ok) {
+          if (!cancelled) {
+            setActiveAccount(null);
+          }
+          return;
+        }
+
+        const body = (await response.json()) as {
+          authenticated: boolean;
+          account: ActiveAccount | null;
+        };
+        if (!cancelled) {
+          setActiveAccount(body.authenticated ? body.account : null);
+          setAccountUsernameInput(body.account?.username ?? "");
+        }
+      } catch {
+        if (!cancelled) {
+          setActiveAccount(null);
+        }
+      } finally {
+        if (!cancelled) {
+          setAuthReady(true);
+        }
+      }
+    }
+
+    void loadSessionAccount();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     const currentStage =
       flowStages.find((stage) => stage.status === "current") ??
       [...flowStages].reverse().find((stage) => stage.status === "done") ??
@@ -279,13 +481,24 @@ export function App() {
   }, [actionPulseStageId]);
 
   async function fetchPasskeyStatus(
-    principalId: DemoPasskeyPrincipal,
+    principalId: string,
     target: "transferor" | "admin",
   ) {
-    const response = await fetch(
-      `${IDENTITY_SERVICE_URL}/principals/${principalId}/passkey-status`,
-    );
-  const body = (await response.json()) as {
+    const response = await fetchIdentity(`/principals/${principalId}/passkey-status`, {
+      method: "GET",
+    });
+    if (response.status === 401) {
+      setActiveAccount(null);
+      setAuthError("Session expired. Please log in again.");
+      const emptyState = createEmptyPasskeyState();
+      if (target === "transferor") {
+        setPasskeyTransferor(emptyState);
+      } else {
+        setPasskeyAdmin(emptyState);
+      }
+      return emptyState;
+    }
+    const body = (await response.json()) as {
       registered: boolean;
       credentials: Array<{
         credentialId: string;
@@ -301,26 +514,33 @@ export function App() {
         proofId: string;
         createdAt: string;
         credentialId: string;
+        proofType: string;
+      };
+      latestVerifiedProof: null | {
+        proofId: string;
+        createdAt: string;
+        credentialId: string;
+        proofType: string;
       };
     };
 
     const firstCredential = body.credentials[0];
+    const latestProof = body.latestVerifiedProof ?? body.latestAuthenticationProof;
     const nextState: PasskeyState = {
       registered: body.registered,
-      verified: Boolean(body.latestAuthenticationProof),
+      verified: body.registered && Boolean(latestProof),
       credentialId: firstCredential?.credentialId ?? "",
       publicKeyRef: firstCredential?.credentialId ?? "",
-      challenge: "",
       registeredAt: firstCredential?.createdAt ?? "",
-      proofRef: body.latestAuthenticationProof?.proofId ?? "",
-      lastVerifiedAt: body.latestAuthenticationProof?.createdAt ?? "",
+      proofRef: latestProof?.proofId ?? "",
+      lastVerifiedAt: latestProof?.createdAt ?? firstCredential?.createdAt ?? "",
+      proofType: latestProof?.proofType ?? "",
       deviceType: firstCredential?.deviceType ?? "",
       backedUp: firstCredential?.backedUp ?? null,
       rpId: firstCredential?.rpId ?? "",
       lastUsedAt: firstCredential?.lastUsedAt ?? "",
       counter: firstCredential?.counter ?? null,
       transports: firstCredential?.transports ?? [],
-      authDebug: null,
     };
 
     if (target === "transferor") {
@@ -333,9 +553,13 @@ export function App() {
   }
 
   async function refreshPasskeys() {
+    if (!activeAccount) {
+      return;
+    }
+
     await Promise.all([
-      fetchPasskeyStatus(DEMO_PRINCIPALS.transferor, "transferor"),
-      fetchPasskeyStatus(DEMO_PRINCIPALS.admin, "admin"),
+      fetchPasskeyStatus(transferorPrincipalId, "transferor"),
+      fetchPasskeyStatus(adminPrincipalId, "admin"),
     ]);
   }
 
@@ -363,20 +587,26 @@ export function App() {
     setArchiveRecords(body.records ?? []);
   }
 
-  async function fetchPolicy(selectedCurrency = currency) {
-    if (!selectedCurrency) {
+  async function fetchPolicy() {
+    const response = await fetch(`${VERIFIER_SERVICE_URL}/verifier/policy/current?currency=USD`);
+    const body = (await response.json()) as unknown;
+    const errorMessage =
+      body && typeof body === "object" && !Array.isArray(body)
+        ? ((body as { error?: string; detail?: string }).error ??
+            (body as { error?: string; detail?: string }).detail ??
+            "")
+        : "";
+
+    if (!response.ok || errorMessage) {
       setPolicyView(null);
+      setPolicyNotice(
+        errorMessage ||
+          "USD is not supported by the active policy bundle",
+      );
       return;
     }
-    const response = await fetch(
-      `${VERIFIER_SERVICE_URL}/verifier/policy/current?currency=${selectedCurrency}`,
-    );
-    const body = (await response.json()) as VerifierPolicyView | { error: string };
-    if ("error" in body) {
-      setPolicyView(null);
-      return;
-    }
-    setPolicyView(body);
+    setPolicyView(body as VerifierPolicyView);
+    setPolicyNotice("");
   }
 
   async function refreshAll() {
@@ -392,35 +622,143 @@ export function App() {
 
   useEffect(() => {
     void refreshAll();
-  }, []);
+  }, [activeAccount?.username]);
 
   useEffect(() => {
     void Promise.all([fetchEvents(), fetchArchive()]);
   }, [flowId]);
 
   useEffect(() => {
-    void fetchPolicy(currency);
-  }, [currency]);
+    if (recipientAccount && recipientAccountRef !== recipientAccount.accountId) {
+      setRecipientAccountRef(recipientAccount.accountId);
+    }
+  }, [recipientAccount?.accountId, recipientAccountRef]);
+
+  useEffect(() => {
+    void fetchPolicy();
+  }, []);
+
+  useEffect(() => {
+    if (!activeAccount) {
+      return;
+    }
+
+    void refreshPasskeys();
+  }, [activeAccount?.username, transferorPrincipalId, adminPrincipalId]);
 
   function resetTransferForm(nextFlowId = `flow_demo_${Date.now()}`) {
     setFlowId(nextFlowId);
     setAmount("");
-    setCurrency("");
+    setAmountError("");
+    setCurrency("USD");
     setMemo("");
     setRecipientAccountRef("");
     setPolicyView(null);
+    setPolicyNotice("");
     setLastVerifierEventId("");
     setAgentTrace(null);
     setEvents([]);
     setArchiveRecords([]);
     setSelectedStageId(null);
+    setInstructionComposerOpen(false);
     setStatus("Ready");
     setActionPulseStageId(null);
+    setInstructionSubmitBusy(false);
   }
 
   function startNewFlowDraft() {
     resetTransferForm();
+    void fetchPolicy();
     setInstructionComposerOpen(true);
+  }
+
+  async function handleEnterAccount(action: "register" | "login") {
+    const username = accountUsernameInput.trim();
+    const password = accountPasswordInput;
+    if (!username || !password) {
+      setAuthError("Please enter both username and password");
+      return;
+    }
+    try {
+      assertEnglishAccountHandle(username);
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "Username must be English");
+      return;
+    }
+    if (action === "register" && passwordStrength.score < 2) {
+      setAuthError("Password must be at least 8 characters and include a number.");
+      return;
+    }
+
+    try {
+      setAuthError("");
+      const response = await fetchIdentity(`/auth/${action}`, {
+        method: "POST",
+        body: JSON.stringify({ username, password }),
+      });
+      const body = (await response.json()) as {
+        ok?: boolean;
+        account?: ActiveAccount;
+        error?: string;
+      };
+      if (!response.ok || !body.account) {
+        throw new Error(body.error ?? "Authentication failed");
+      }
+
+      setActiveAccount(body.account);
+      setPasskeyTransferor(createEmptyPasskeyState());
+      setPasskeyAdmin(createEmptyPasskeyState());
+      setAccountPasswordInput("");
+      resetTransferForm();
+      setAccountUsernameInput(body.account.username);
+      setStatus(action === "register" ? "Account registered" : "Logged in");
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "Authentication failed");
+    }
+  }
+
+  async function handleLogout() {
+    await fetchIdentity("/auth/logout", { method: "POST" });
+    setActiveAccount(null);
+    setAccountUsernameInput("");
+    setAccountPasswordInput("");
+    setPasskeyTransferor(createEmptyPasskeyState());
+    setPasskeyAdmin(createEmptyPasskeyState());
+    resetTransferForm();
+    setAuthError("");
+    setStatus("Logged out");
+  }
+
+  function getMissingPasskeyMessage() {
+    const missing: string[] = [];
+
+    if (!passkeyTransferor.registered) {
+      missing.push("Transferor passkey");
+    }
+    if (!passkeyAdmin.registered) {
+      missing.push("Administrator passkey");
+    }
+
+    if (missing.length === 0) {
+      return "";
+    }
+
+    if (missing.length === 2) {
+      return "Transferor and administrator passkeys must be registered before editing a human instruction";
+    }
+
+    return `${missing[0]} must be registered before editing a human instruction`;
+  }
+
+  function openInstructionComposerGuarded() {
+    const missingPasskeyMessage = getMissingPasskeyMessage();
+    if (missingPasskeyMessage) {
+      setStatus(missingPasskeyMessage);
+      return false;
+    }
+
+    setInstructionComposerOpen(true);
+    return true;
   }
 
   function pulseAndRun(stageId: FlowStageId, action: () => void) {
@@ -428,41 +766,12 @@ export function App() {
     action();
   }
 
-  async function registerPasskey(
-    principalId: DemoPasskeyPrincipal,
-    role: "transferor" | "administrator",
-  ) {
-    const optionsResponse = await fetch(`${IDENTITY_SERVICE_URL}/webauthn/register/options`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ principalId, role }),
-    });
-    const optionsBody = (await optionsResponse.json()) as { options?: unknown; error?: string };
-    if (!optionsResponse.ok || !optionsBody.options) {
-      throw new Error(optionsBody.error ?? "Failed to load registration options");
-    }
-
-    const attResp = await startRegistration({ optionsJSON: optionsBody.options as never });
-    const verifyResponse = await fetch(`${IDENTITY_SERVICE_URL}/webauthn/register/verify`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ principalId, role, response: attResp }),
-    });
-    const verifyBody = (await verifyResponse.json()) as { error?: string };
-    if (!verifyResponse.ok) {
-      throw new Error(verifyBody.error ?? "Failed to verify registration");
-    }
-
-    await refreshPasskeys();
-  }
-
   async function authenticatePasskey(
-    principalId: DemoPasskeyPrincipal,
+    principalId: string,
     role: "transferor" | "administrator",
-  ) {
-    const optionsResponse = await fetch(`${IDENTITY_SERVICE_URL}/webauthn/authenticate/options`, {
+  ): Promise<AuthenticatePasskeyResult> {
+    const optionsResponse = await fetchIdentity("/webauthn/authenticate/options", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ principalId, role }),
     });
     const optionsBody = (await optionsResponse.json()) as { options?: unknown; error?: string };
@@ -470,81 +779,68 @@ export function App() {
       throw new Error(optionsBody.error ?? "Failed to load authentication options");
     }
 
-    const authOptions = optionsBody.options as {
-      challenge?: string;
-      rpId?: string;
-      userVerification?: string;
-      allowCredentials?: Array<{ id: string; transports?: string[] }>;
-    };
-
-    if (principalId === DEMO_PRINCIPALS.transferor) {
-      setPasskeyTransferor((current) => ({
-        ...current,
-        challenge: authOptions.challenge ?? "",
-        authDebug: {
-          challenge: authOptions.challenge ?? "",
-          rpId: authOptions.rpId,
-          userVerification: authOptions.userVerification,
-          allowCredentials: authOptions.allowCredentials ?? [],
-        },
-      }));
-    } else {
-      setPasskeyAdmin((current) => ({
-        ...current,
-        challenge: authOptions.challenge ?? "",
-        authDebug: {
-          challenge: authOptions.challenge ?? "",
-          rpId: authOptions.rpId,
-          userVerification: authOptions.userVerification,
-          allowCredentials: authOptions.allowCredentials ?? [],
-        },
-      }));
-    }
-
     const authResp = await startAuthentication({ optionsJSON: optionsBody.options as never });
-    const verifyResponse = await fetch(`${IDENTITY_SERVICE_URL}/webauthn/authenticate/verify`, {
+    const verifyResponse = await fetchIdentity("/webauthn/authenticate/verify", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ principalId, role, response: authResp }),
     });
-    const verifyBody = (await verifyResponse.json()) as { error?: string };
-    if (!verifyResponse.ok) {
-      throw new Error(verifyBody.error ?? "Failed to verify authentication");
-    }
-
-    const refreshedState = await fetchPasskeyStatus(
-      principalId,
-      principalId === DEMO_PRINCIPALS.transferor ? "transferor" : "admin",
-    );
-    const enrichedState: PasskeyState = {
-      ...refreshedState,
-      challenge: authOptions.challenge ?? "",
-      authDebug: {
-        challenge: authOptions.challenge ?? "",
-        rpId: authOptions.rpId,
-        userVerification: authOptions.userVerification,
-        allowCredentials: authOptions.allowCredentials ?? [],
-      },
+    const verifyBody = (await verifyResponse.json()) as {
+      verified?: boolean;
+      proofId?: string;
+      credentialId?: string;
+      error?: string;
     };
-
-    if (principalId === DEMO_PRINCIPALS.transferor) {
-      setPasskeyTransferor(enrichedState);
-    } else {
-      setPasskeyAdmin(enrichedState);
+    if (!verifyResponse.ok || !verifyBody.verified || !verifyBody.proofId) {
+      throw new Error(verifyBody.error ?? "Failed to verify authentication response");
     }
 
-    return enrichedState;
+    void refreshPasskeys();
+    return {
+      proofId: verifyBody.proofId,
+      credentialId: verifyBody.credentialId ?? "",
+    };
+  }
+
+  async function registerPasskey(
+    principalId: string,
+    role: "transferor" | "administrator",
+  ) {
+    try {
+      const optionsResponse = await fetchIdentity("/webauthn/register/options", {
+        method: "POST",
+        body: JSON.stringify({ principalId, role }),
+      });
+      const optionsBody = (await optionsResponse.json()) as { options?: unknown; error?: string };
+      if (!optionsResponse.ok || !optionsBody.options) {
+        throw new Error(optionsBody.error ?? "Failed to load registration options");
+      }
+
+      const attResp = await startRegistration({ optionsJSON: optionsBody.options as never });
+      const verifyResponse = await fetchIdentity("/webauthn/register/verify", {
+        method: "POST",
+        body: JSON.stringify({ principalId, role, response: attResp }),
+      });
+      const verifyBody = (await verifyResponse.json()) as { error?: string };
+      if (!verifyResponse.ok) {
+        throw new Error(verifyBody.error ?? "Failed to verify registration");
+      }
+
+      await refreshPasskeys();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Failed to register passkey");
+    }
   }
 
   async function createInstructionEvent() {
-    if (!passkeyTransferor.registered || !passkeyTransferor.verified || !passkeyTransferor.proofRef) {
-      throw new Error("Transferor must authenticate with a registered passkey first");
+    if (!passkeyTransferor.registered || !passkeyTransferor.proofRef) {
+      throw new Error("Transferor must register a passkey first");
     }
+    const instructionAmount = normalizeAmountInput(amount) || amount;
 
     const eventPayload = {
       id: `evt_instr_${flowId}_hash`,
       kind: 101,
-      ai_id: DEMO_PRINCIPALS.transferor,
+      ai_id: transferorPrincipalId,
       created_at: Math.floor(Date.now() / 1000),
       tags: [
         ["flow_id", flowId],
@@ -552,13 +848,13 @@ export function App() {
         ["action", "transfer"],
       ],
       content: {
-        instruction_id: `instr_${flowId}`,
-        principal_id: DEMO_PRINCIPALS.transferor,
-        agent_id: DEMO_AGENT_IDS.transfer,
-        action_type: "payment.transfer",
-        amount,
-        currency,
-        recipient_id: DEMO_PRINCIPALS.recipient,
+          instruction_id: `instr_${flowId}`,
+          principal_id: transferorPrincipalId,
+          agent_id: DEMO_AGENT_IDS.transfer,
+          action_type: "payment.transfer",
+          amount: instructionAmount,
+          currency,
+        recipient_id: recipientPrincipalId,
         recipient_account_ref: recipientAccountRef,
         memo,
         submitted_at: new Date().toISOString(),
@@ -594,8 +890,8 @@ export function App() {
           signature_alg: "webauthn-passkey-es256",
           credential_id: passkeyTransferor.credentialId,
           public_key_ref: passkeyTransferor.publicKeyRef,
-          challenge: passkeyTransferor.challenge || `chl_${Date.now()}`,
-          signed_at: passkeyTransferor.registeredAt || new Date().toISOString(),
+          challenge: `registration_ready_${flowId}`,
+          signed_at: passkeyTransferor.lastVerifiedAt || passkeyTransferor.registeredAt || new Date().toISOString(),
           verifier_material_ref: "webauthn_assertion_bundle_001",
         },
       },
@@ -616,6 +912,7 @@ export function App() {
   }
 
   async function createEnvelopeEvent(instructionEventId: string) {
+    const envelopeAmount = normalizeAmountInput(amount) || amount;
     const eventPayload = {
       id: `evt_env_${Date.now()}_hash`,
       kind: 102,
@@ -627,10 +924,10 @@ export function App() {
       ],
       content: {
         instruction_ref: instructionEventId,
-        action: {
-          params: {
-            amount,
-            currency,
+            action: {
+              params: {
+                amount: envelopeAmount,
+                currency,
             recipient_account_ref: recipientAccountRef,
             memo,
           },
@@ -660,24 +957,33 @@ export function App() {
       if (!amount || !currency || !recipientAccountRef) {
         throw new Error("Please complete amount, currency, and recipient before submitting");
       }
-
-      setStatus("Waiting for transferor passkey signature...");
-      const latestPasskey = await authenticatePasskey(DEMO_PRINCIPALS.transferor, "transferor");
-      if (!latestPasskey?.proofRef) {
-        throw new Error("Transferor passkey signature was not captured");
+      if (amountValidationMessage) {
+        throw new Error(amountValidationMessage);
       }
 
-      setStatus("Validating signature and sending human instruction to agent...");
+      const submissionAmount = normalizedAmount;
+      if (!submissionAmount) {
+        throw new Error("Amount must be a valid number");
+      }
+      setStatus("Signing the transferor passkey challenge...");
+      const transferorAuth = await authenticatePasskey(transferorPrincipalId, "transferor");
+      setStatus("Using registered transferor passkey proof and sending human instruction to agent...");
       const response = await fetch(`${AGENT_SERVICE_URL}/transfers/evaluate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           flowId,
-          amount,
+          amount: submissionAmount,
           currency,
           memo,
           recipientAccountRef,
-          transferorPasskey: latestPasskey,
+          recipientId: recipientPrincipalId,
+          transferorPasskey: {
+            ...passkeyTransferor,
+            verified: true,
+            proofRef: transferorAuth.proofId,
+          },
+          principalId: transferorPrincipalId,
         }),
       });
 
@@ -812,13 +1118,9 @@ export function App() {
         throw new Error("Administrator must register a passkey first");
       }
 
-      setStatus("Waiting for administrator passkey signature...");
-      const latestAdminPasskey = await authenticatePasskey(DEMO_PRINCIPALS.admin, "administrator");
-      if (!latestAdminPasskey?.proofRef) {
-        throw new Error("Administrator passkey signature was not captured");
-      }
-
-      setStatus("Sending administrator approval to agent...");
+      setStatus("Signing the administrator passkey challenge...");
+      const adminAuth = await authenticatePasskey(adminPrincipalId, "administrator");
+      setStatus("Using registered administrator passkey proof and sending approval to agent...");
       const response = await fetch(`${AGENT_SERVICE_URL}/transfers/admin-approve`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -827,8 +1129,9 @@ export function App() {
           firstVerifierEventId: firstVerifierEvent.eventId,
           envelopeEventId: envelopeEvent.eventId,
           instructionEventId: instructionEvent.eventId,
-          adminProofRef: latestAdminPasskey.proofRef,
-          adminVerified: latestAdminPasskey.verified,
+          adminProofRef: adminAuth.proofId,
+          adminVerified: true,
+          adminPrincipalId,
         }),
       });
 
@@ -901,7 +1204,7 @@ export function App() {
         payload: {
           id: `evt_instr_${input.flowId}_hash`,
           kind: 101,
-          ai_id: DEMO_PRINCIPALS.transferor,
+          ai_id: transferorPrincipalId,
           created_at: Math.floor(Date.now() / 1000),
           tags: [
             ["flow_id", input.flowId],
@@ -910,12 +1213,12 @@ export function App() {
           ],
           content: {
             instruction_id: `instr_${input.flowId}`,
-            principal_id: DEMO_PRINCIPALS.transferor,
+            principal_id: transferorPrincipalId,
             agent_id: DEMO_AGENT_IDS.transfer,
             action_type: "payment.transfer",
             amount: input.amountValue,
             currency: input.currencyValue,
-            recipient_id: DEMO_PRINCIPALS.recipient,
+            recipient_id: recipientPrincipalId,
             recipient_account_ref: input.recipientAccount,
             memo: input.memoValue,
             submitted_at: new Date().toISOString(),
@@ -989,33 +1292,83 @@ export function App() {
     return (await response.json()) as { event: EventRecord };
   }
 
-  async function handleResetDemoData() {
-    try {
-      setStatus("Resetting demo data across event, archive, and bank services...");
-      await Promise.all([
-        fetch(`${EVENT_SERVICE_URL}/admin/reset-demo`, { method: "POST" }),
-        fetch(`${ARCHIVE_SERVICE_URL}/admin/reset-demo`, { method: "POST" }),
-        fetch(`${MCP_BANK_URL}/admin/reset-demo`, { method: "POST" }),
-        fetch(`${IDENTITY_SERVICE_URL}/admin/reset-demo`, { method: "POST" }),
-      ]);
-      setFlowId(`flow_demo_${Date.now()}`);
-      setEvents([]);
-      setArchiveRecords([]);
-      setTransactions([]);
-      setLastVerifierEventId("");
-      setAgentTrace(null);
-      setRecipientAccountRef("acct_recipient_bob_001");
-      setCurrency("USD");
-      setAmount("800.00");
-      setMemo("vendor settlement");
-      setPasskeyTransferor(createEmptyPasskeyState());
-      setPasskeyAdmin(createEmptyPasskeyState());
-      setSelectedStageId(null);
-      setStatus("Demo data reset. System is back to a clean starting state.");
-      await refreshAll();
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Failed to reset demo data");
-    }
+  if (!authReady) {
+    return (
+      <div className="authShell">
+        <main className="authCard">
+          <div className="authBadge">SAFR x ATP Demo</div>
+          <h1>Checking sign-in state</h1>
+          <p>We are confirming with the backend whether you are already signed in.</p>
+        </main>
+      </div>
+    );
+  }
+
+  if (!activeAccount) {
+    return (
+      <div className="authShell">
+        <div className="authBackdrop authBackdropOne" />
+        <div className="authBackdrop authBackdropTwo" />
+        <main className="authCard">
+          <div className="authBadge">SAFR x ATP Demo</div>
+          <h1>Register or sign in to continue</h1>
+          <p>
+            Create a stable account for each person first. After you enter, the transferor and
+            admin principals in the transfer flow will stay bound to this account, and your
+            passkey will remain available.
+          </p>
+          <label className="authField">
+            <span>Username</span>
+            <input
+              value={accountUsernameInput}
+              onChange={(event) => setAccountUsernameInput(event.target.value)}
+              placeholder="English only, e.g. alice / bob / team-lead"
+              autoComplete="username"
+            />
+          </label>
+          <label className="authField">
+            <span>Password</span>
+            <input
+              type="password"
+              value={accountPasswordInput}
+              onChange={(event) => setAccountPasswordInput(event.target.value)}
+              placeholder="Set or enter your password"
+              autoComplete="current-password"
+            />
+          </label>
+          <div className="authStrength" aria-live="polite">
+            <div className="authStrengthHeader">
+              <span>Password requirements</span>
+              <strong className={`authStrengthLabel strength-${passwordStrength.score === 2 ? "strong" : passwordStrength.score === 1 ? "fair" : "weak"}`}>
+                {passwordStrength.label}
+              </strong>
+            </div>
+            <div className="authStrengthBar" aria-hidden="true">
+              <div className={`authStrengthFill strength-${passwordStrength.score === 2 ? "strong" : passwordStrength.score === 1 ? "fair" : "weak"}`} style={{ width: `${Math.min(100, passwordStrength.score * 50)}%` }} />
+            </div>
+            <p className="authStrengthCopy">{passwordStrength.description}</p>
+            <ul className="authStrengthChecks">
+              {passwordStrength.checks.map((check) => (
+                <li key={check}>{check}</li>
+              ))}
+            </ul>
+          </div>
+          <div className="authActions">
+            <button type="button" onClick={() => void handleEnterAccount("register")}>
+              Register and enter
+            </button>
+            <button type="button" className="secondary" onClick={() => void handleEnterAccount("login")}>
+              Sign in
+            </button>
+          </div>
+          <div className="authHint">
+            <span>Accounts and sessions are stored on the backend.</span>
+            <span>Username must be English only, and password must be 8+ characters with a number.</span>
+          </div>
+          {authError ? <div className="rejectBanner"><strong>{authError}</strong></div> : null}
+        </main>
+      </div>
+    );
   }
 
   return (
@@ -1023,10 +1376,16 @@ export function App() {
       <header className="hero">
         <div>
           <h1>SAFR x ATP Transfer Demo</h1>
+          <p>
+            Active account: <strong>{activeAccountLabel}</strong> · Transferor:{" "}
+            <code>{transferorPrincipalId}</code> · Admin: <code>{adminPrincipalId}</code>
+          </p>
         </div>
-        <button className="danger" onClick={() => void handleResetDemoData()}>
-          Reset Demo Data
-        </button>
+        <div className="heroActions">
+          <button className="secondary" onClick={() => void handleLogout()}>
+            Switch account
+          </button>
+        </div>
       </header>
 
       <section className="panel">
@@ -1077,19 +1436,17 @@ export function App() {
           subtitle="Signs original instruction"
           status={
             passkeyTransferor.registered
-              ? passkeyTransferor.verified
-                ? "Passkey Verified"
-                : "Registered Not Verified"
+              ? "Passkey Ready"
               : "Passkey Not Registered"
           }
-          principal={DEMO_PRINCIPALS.transferor}
+          principal={transferorPrincipalId}
           detail={transferorAccount ? `${transferorAccount.accountId} · $${transferorAccount.availableBalance}` : "Loading account"}
         />
         <RoleCard
           title="Recipient"
           subtitle="Read-only balance view"
           status="Read Only"
-          principal={DEMO_PRINCIPALS.recipient}
+          principal={recipientPrincipalId}
           detail={recipientAccount ? `${recipientAccount.accountId} · $${recipientAccount.availableBalance}` : "Loading account"}
         />
         <RoleCard
@@ -1097,12 +1454,10 @@ export function App() {
           subtitle="Signs only for high-value transfers"
           status={
             passkeyAdmin.registered
-              ? passkeyAdmin.verified
-                ? "Passkey Verified"
-                : "Registered Not Verified"
+              ? "Passkey Ready"
               : "Passkey Not Registered"
           }
-          principal={DEMO_PRINCIPALS.admin}
+          principal={adminPrincipalId}
           detail={requiresAdmin ? "Needed for this transfer" : "Not needed below threshold"}
         />
       </section>
@@ -1112,22 +1467,20 @@ export function App() {
         <div className="passkeyGrid">
           <PasskeyCard
             title="Transferor Passkey"
-            principalId={DEMO_PRINCIPALS.transferor}
+            principalId={transferorPrincipalId}
             state={passkeyTransferor}
-            onRegister={() => void registerPasskey(DEMO_PRINCIPALS.transferor, "transferor")}
-            onAuthenticate={() => void authenticatePasskey(DEMO_PRINCIPALS.transferor, "transferor")}
+            onRegister={() => void registerPasskey(transferorPrincipalId, "transferor")}
           />
           <PasskeyCard
             title="Administrator Passkey"
-            principalId={DEMO_PRINCIPALS.admin}
+            principalId={adminPrincipalId}
             state={passkeyAdmin}
-            onRegister={() => void registerPasskey(DEMO_PRINCIPALS.admin, "administrator")}
-            onAuthenticate={() => void authenticatePasskey(DEMO_PRINCIPALS.admin, "administrator")}
+            onRegister={() => void registerPasskey(adminPrincipalId, "administrator")}
           />
         </div>
         <p className="hint">
-          Passkeys start empty on entry. Register them manually and complete a real WebAuthn
-          authentication before submitting a transfer or admin approval.
+          Passkeys start empty on entry. Once registered, they move straight into a ready state and
+          can be used directly for transfer submission or administrator approval.
         </p>
       </section>
 
@@ -1142,6 +1495,60 @@ export function App() {
             </p>
           </div>
         </div>
+
+        <div className={`flowPolicyBanner ${policyView ? "flowPolicyBannerReady" : "flowPolicyBannerWarn"}`}>
+          <div className="flowPolicyBannerCopy">
+            <span>Active Governance Bundle</span>
+            <strong>
+              {policyView ? `${policyView.bundle.bundleId} · ${policyView.bundle.bundleVersion}` : "Policy status"}
+            </strong>
+            <small>{policySummary}</small>
+          </div>
+          <div className="flowPolicyBannerMeta flowPolicyBannerMetaCompact">
+            {policyView ? (
+              <>
+                <div>
+                  <span>Currency</span>
+                  <strong>{policyView.policy.currency}</strong>
+                </div>
+                <div>
+                  <span>Threshold</span>
+                  <strong>{policyView.policy.currency} {policyView.policy.adminReviewAtOrAbove.toFixed(2)}</strong>
+                </div>
+                <div>
+                  <span>Admin signature</span>
+                  <strong>Required above threshold</strong>
+                </div>
+              </>
+            ) : (
+              <>
+                <div>
+                  <span>State</span>
+                  <strong>{policyNotice ? "Loading" : "Waiting"}</strong>
+                </div>
+                <div>
+                  <span>Policy</span>
+                  <strong>USD only</strong>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+
+        {status !== "Ready" ? (
+          <div className={`flowStatusBanner statusTone-${getAppStatusTone(status, instructionSubmitBusy)}`}>
+            <strong>
+              {getAppStatusTone(status, instructionSubmitBusy) === "error"
+                ? "Error"
+                : getAppStatusTone(status, instructionSubmitBusy) === "success"
+                  ? "Success"
+                  : getAppStatusTone(status, instructionSubmitBusy) === "processing"
+                    ? "Processing"
+                    : "Status"}
+            </strong>
+            <span>{status}</span>
+          </div>
+        ) : null}
 
         <div className="flowStageLane">
           <FlowRelayMap
@@ -1158,18 +1565,23 @@ export function App() {
             status={status}
             policyView={policyView}
             onOpenStage={(stageId) => setSelectedStageId(stageId)}
-            onOpenInstructionComposer={() => setInstructionComposerOpen(true)}
+            onOpenInstructionComposer={openInstructionComposerGuarded}
             onNewInstruction={startNewFlowDraft}
             requiresAdmin={requiresAdmin}
             showAdminAction={requiresAdmin}
             canAdminApprove={Boolean(passkeyAdmin.registered && firstVerifierEvent?.kind === 104)}
             canExecute={canExecute}
-            highlightSubmit={isDraft || (!firstVerifierEvent && !envelopeEvent)}
+            highlightSubmit={instructionSubmitBusy || isDraft || (!firstVerifierEvent && !envelopeEvent)}
             highlightAdmin={isWaitingForAdmin}
             highlightExecute={isReadyForExecution}
             onSubmitToVerifier={() => {
+              const missingPasskeyMessage = getMissingPasskeyMessage();
+              if (missingPasskeyMessage) {
+                setStatus(missingPasskeyMessage);
+                return;
+              }
               if (!amount || !currency || !recipientAccountRef) {
-                setInstructionComposerOpen(true);
+                openInstructionComposerGuarded();
                 return;
               }
               pulseAndRun("instruction", () => void handleEvaluate());
@@ -1267,6 +1679,9 @@ export function App() {
           agentTrace={agentTrace}
           policyView={policyView}
           status={status}
+          transferorPrincipalId={transferorPrincipalId}
+          adminPrincipalId={adminPrincipalId}
+          recipientPrincipalId={recipientPrincipalId}
         />
       ) : null}
 
@@ -1277,18 +1692,52 @@ export function App() {
           currency={currency}
           memo={memo}
           recipientAccountRef={recipientAccountRef}
+          allowlistedRecipientAccountRef={recipientAccount?.accountId ?? ""}
           status={status}
+          amountError={amountError || amountValidationMessage}
+          availableBalance={transferorAvailableBalance}
           policyView={policyView}
-          onClose={() => setInstructionComposerOpen(false)}
-          onAmountChange={setAmount}
+          onClose={() => {
+            setInstructionComposerOpen(false);
+            setAmountError("");
+          }}
+          onNewInstruction={startNewFlowDraft}
+          onAmountChange={(value) => {
+            const nextAmount = sanitizeAmountInput(value);
+            setAmount(nextAmount);
+            setAmountError(getAmountValidationMessage(nextAmount, transferorAvailableBalance));
+          }}
+          onAmountBlur={() => {
+            const normalized = normalizeAmountInput(amount);
+            if (normalized) {
+              setAmount(normalized);
+              setAmountError(getAmountValidationMessage(normalized, transferorAvailableBalance));
+              return;
+            }
+
+            setAmountError(getAmountValidationMessage(amount, transferorAvailableBalance));
+          }}
           onCurrencyChange={setCurrency}
           onMemoChange={setMemo}
           onRecipientChange={setRecipientAccountRef}
+          submitDisabled={instructionSubmitBusy}
           onSubmit={async () => {
-            const ok = await handleEvaluate();
-            if (ok) {
-              setInstructionComposerOpen(false);
-              setActionPulseStageId("instruction");
+            if (instructionSubmitBusy) {
+              return;
+            }
+            if (amountValidationMessage) {
+              setAmountError(amountValidationMessage);
+              return;
+            }
+            setInstructionSubmitBusy(true);
+            setActionPulseStageId("instruction");
+            try {
+              const ok = await handleEvaluate();
+              if (ok) {
+                setInstructionComposerOpen(false);
+              }
+            } finally {
+              setInstructionSubmitBusy(false);
             }
           }}
         />
@@ -1304,7 +1753,7 @@ function RoleCard(props: {
   detail: string;
   principal?: string;
 }) {
-  const badgeClassName = props.status === "Passkey Verified" ? "badge badgeVerified" : "badge";
+  const badgeClassName = props.status === "Passkey Ready" ? "badge badgeVerified" : "badge";
 
   return (
     <div className="roleCard">
@@ -1327,7 +1776,6 @@ function PasskeyCard(props: {
   principalId: string;
   state: PasskeyState;
   onRegister: () => void;
-  onAuthenticate: () => void;
 }) {
   return (
     <div className="passkeyCard">
@@ -1338,6 +1786,7 @@ function PasskeyCard(props: {
       </div>
       {props.state.registered ? (
         <>
+          <div className="badge badgeVerified passkeyReadyBadge">Passkey Ready</div>
           <small>{props.state.credentialId}</small>
           <div className="passkeyMetaGrid">
             <PasskeyMetaItem label="RP ID" value={props.state.rpId || "unknown"} />
@@ -1358,50 +1807,14 @@ function PasskeyCard(props: {
             />
             <PasskeyMetaItem
               label="Last Used"
-              value={props.state.lastUsedAt || "not yet authenticated"}
+              value={props.state.lastUsedAt || "registered just now"}
             />
           </div>
-          <small>{props.state.lastVerifiedAt ? `Last verified: ${props.state.lastVerifiedAt}` : "Not authenticated yet"}</small>
-          {props.state.authDebug ? (
-            <div className="passkeyDebug">
-              <strong>Authentication Request Debug</strong>
-              <div className="passkeyMetaGrid">
-                <PasskeyMetaItem label="Challenge" value={props.state.authDebug.challenge || "missing"} />
-                <PasskeyMetaItem label="RP ID" value={props.state.authDebug.rpId || "missing"} />
-                <PasskeyMetaItem
-                  label="User Verification"
-                  value={props.state.authDebug.userVerification || "missing"}
-                />
-                <PasskeyMetaItem
-                  label="Allowed Credential IDs"
-                  value={
-                    props.state.authDebug.allowCredentials.length > 0
-                      ? props.state.authDebug.allowCredentials.map((item) => item.id).join(", ")
-                      : "none"
-                  }
-                />
-                <PasskeyMetaItem
-                  label="Allowed Transports"
-                  value={
-                    props.state.authDebug.allowCredentials.length > 0
-                      ? props.state.authDebug.allowCredentials
-                          .map((item) =>
-                            item.transports && item.transports.length > 0
-                              ? item.transports.join("|")
-                              : "unspecified",
-                          )
-                          .join(", ")
-                      : "none"
-                  }
-                />
-              </div>
-            </div>
-          ) : null}
-          <div className="actions">
-            <button className="secondary" onClick={props.onAuthenticate}>
-              Authenticate Passkey
-            </button>
-          </div>
+          <small>
+            {props.state.lastVerifiedAt
+              ? `Ready since: ${props.state.lastVerifiedAt}`
+              : "Ready immediately after registration"}
+          </small>
         </>
       ) : (
         <>
@@ -1502,7 +1915,7 @@ function FlowRelayMap(props: {
           actionTone="primary"
           actionEnabled
           actionHighlighted={props.highlightSubmit}
-          onAction={props.onSubmitToVerifier}
+          onAction={props.onOpenInstructionComposer}
         />
         <RelayLink
           status={instruction?.status ?? "pending"}
@@ -1595,15 +2008,25 @@ function InstructionComposerModal(props: {
   currency: string;
   memo: string;
   recipientAccountRef: string;
+  allowlistedRecipientAccountRef: string;
   status: string;
+  amountError: string;
+  availableBalance: number | null;
+  submitDisabled: boolean;
   policyView: VerifierPolicyView | null;
   onClose: () => void;
+  onNewInstruction: () => void;
   onAmountChange: (value: string) => void;
+  onAmountBlur: () => void;
   onCurrencyChange: (value: string) => void;
   onMemoChange: (value: string) => void;
   onRecipientChange: (value: string) => void;
   onSubmit: () => Promise<void>;
 }) {
+  const threshold = props.policyView?.policy.adminReviewAtOrAbove ?? 1000;
+  const amountValue = Number(normalizeAmountInput(props.amount) || props.amount);
+  const requiresAdmin = Number.isFinite(amountValue) && amountValue >= threshold;
+
   return (
     <div className="flowModalBackdrop" onClick={props.onClose}>
       <div className="flowModal instructionComposerModal" onClick={(event) => event.stopPropagation()}>
@@ -1616,21 +2039,39 @@ function InstructionComposerModal(props: {
           <button className="flowModalClose" type="button" onClick={props.onClose}>
             Close
           </button>
+          <button
+            className="flowModalSecondaryAction"
+            type="button"
+            onClick={props.onNewInstruction}
+          >
+            New Instruction
+          </button>
         </div>
 
         <div className="instructionComposerGrid">
           <label className="flowCommandField">
             <span>Amount</span>
-            <input value={props.amount} onChange={(event) => props.onAmountChange(event.target.value)} />
+            <input
+              type="text"
+              inputMode="decimal"
+              autoComplete="off"
+              placeholder="0.00"
+              value={props.amount}
+              onChange={(event) => props.onAmountChange(event.target.value)}
+              onBlur={props.onAmountBlur}
+            />
+            {props.amountError ? (
+              <small className="flowFieldError">{props.amountError}</small>
+            ) : props.availableBalance !== null ? (
+              <small className="flowFieldHint">
+                Available balance: USD {props.availableBalance.toFixed(2)}
+              </small>
+            ) : null}
           </label>
-          <label className="flowCommandField">
+          <div className="flowCommandField">
             <span>Currency</span>
-            <select value={props.currency} onChange={(event) => props.onCurrencyChange(event.target.value)}>
-              <option value="">Select currency</option>
-              <option value="USD">USD</option>
-              <option value="EUR">EUR (Expect Reject)</option>
-            </select>
-          </label>
+            <div className="flowStaticValue">USD</div>
+          </div>
           <label className="flowCommandField">
             <span>Recipient</span>
             <select
@@ -1638,7 +2079,11 @@ function InstructionComposerModal(props: {
               onChange={(event) => props.onRecipientChange(event.target.value)}
             >
               <option value="">Select recipient account</option>
-              <option value="acct_recipient_bob_001">acct_recipient_bob_001 (Allowlisted)</option>
+              {props.allowlistedRecipientAccountRef ? (
+                <option value={props.allowlistedRecipientAccountRef}>
+                  {props.allowlistedRecipientAccountRef} (Allowlisted for this account)
+                </option>
+              ) : null}
               <option value="acct_external_vendor_009">
                 acct_external_vendor_009 (Expect Reject)
               </option>
@@ -1658,7 +2103,9 @@ function InstructionComposerModal(props: {
             </div>
             <div className="flowBundleMeta">
               <span>Status</span>
-              <strong>{props.status}</strong>
+              <strong className={`instructionComposerStatus statusTone-${getAppStatusTone(props.status, props.submitDisabled)}`}>
+                {props.status}
+              </strong>
             </div>
             {props.policyView ? (
               <div className="flowBundleMeta">
@@ -1666,15 +2113,30 @@ function InstructionComposerModal(props: {
                 <strong>
                   Auto below {props.policyView.policy.currency}{" "}
                   {props.policyView.policy.autoExecuteBelow.toFixed(2)} · Admin at{" "}
-                  {props.policyView.policy.adminReviewAtOrAbove.toFixed(2)}
+                  {props.policyView.policy.adminReviewAtOrAbove.toFixed(2)} or above
                 </strong>
               </div>
             ) : null}
           </div>
-          <div className="actions">
-            <button type="button" onClick={() => void props.onSubmit()}>
-              Confirm and Submit To Verifier
-            </button>
+          <div className="instructionComposerActionColumn">
+            {requiresAdmin ? (
+              <div className="instructionThresholdNotice" role="status" aria-live="polite">
+                <span className="instructionThresholdNoticeLabel">Admin review required</span>
+                <strong>
+                  This amount is at or above the auto-execution threshold. It will require admin
+                  secondary confirmation before execution.
+                </strong>
+              </div>
+            ) : null}
+            <div className="actions">
+              <button
+                type="button"
+                disabled={props.submitDisabled || Boolean(props.amountError)}
+                onClick={() => void props.onSubmit()}
+              >
+                {props.submitDisabled ? "Submitting..." : "Confirm and Submit To Verifier"}
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -1805,6 +2267,9 @@ function FlowStageModal(props: {
   agentTrace: AgentTrace | null;
   policyView: VerifierPolicyView | null;
   status: string;
+  transferorPrincipalId: string;
+  adminPrincipalId: string;
+  recipientPrincipalId: string;
 }) {
   const [viewMode, setViewMode] = useState<"presentation" | "technical">("presentation");
 
@@ -1829,6 +2294,9 @@ function FlowStageModal(props: {
     agentTrace: props.agentTrace,
     policyView: props.policyView,
     status: props.status,
+    transferorPrincipalId: props.transferorPrincipalId,
+    adminPrincipalId: props.adminPrincipalId,
+    recipientPrincipalId: props.recipientPrincipalId,
   });
 
   return (
@@ -2373,17 +2841,16 @@ function createEmptyPasskeyState(): PasskeyState {
     verified: false,
     credentialId: "",
     publicKeyRef: "",
-    challenge: "",
     registeredAt: "",
     proofRef: "",
     lastVerifiedAt: "",
+    proofType: "",
     deviceType: "",
     backedUp: null,
     rpId: "",
     lastUsedAt: "",
     counter: null,
     transports: [],
-    authDebug: null,
   };
 }
 
@@ -3197,6 +3664,9 @@ function getFlowStageDetailSections(
     agentTrace: AgentTrace | null;
     policyView: VerifierPolicyView | null;
     status: string;
+    transferorPrincipalId: string;
+    adminPrincipalId: string;
+    recipientPrincipalId: string;
   },
 ): Array<
   | { title: string; type: "rows"; rows: Array<{ label: string; value: string }> }
@@ -3214,8 +3684,8 @@ function getFlowStageDetailSections(
           rows: [
             { label: "What happens here", value: "Human signs the transfer instruction with passkey-backed identity proof" },
             { label: "Current status", value: stage.statusLabel },
-            { label: "Transferor Principal", value: DEMO_PRINCIPALS.transferor },
-            { label: "Recipient Principal", value: DEMO_PRINCIPALS.recipient },
+            { label: "Transferor Principal", value: input.transferorPrincipalId },
+            { label: "Recipient Principal", value: input.recipientPrincipalId },
             { label: "Primary handoff", value: "Signed Kind 101 instruction -> Agent" },
           ],
         },
@@ -3250,8 +3720,8 @@ function getFlowStageDetailSections(
           type: "rows",
           rows: [
             { label: "Skill contract", value: input.agentTrace?.skillName ?? "governed_transfer_skill_v1" },
-            { label: "Transferor Principal", value: DEMO_PRINCIPALS.transferor },
-            { label: "Recipient Principal", value: DEMO_PRINCIPALS.recipient },
+            { label: "Transferor Principal", value: input.transferorPrincipalId },
+            { label: "Recipient Principal", value: input.recipientPrincipalId },
             { label: "Agent Principal", value: DEMO_PRINCIPALS.agent },
             {
               label: "Mandatory tools",
@@ -3295,8 +3765,8 @@ function getFlowStageDetailSections(
           title: "Verifier Checks Overview",
           type: "rows",
           rows: [
-            { label: "Transferor Principal", value: DEMO_PRINCIPALS.transferor },
-            { label: "Recipient Principal", value: DEMO_PRINCIPALS.recipient },
+            { label: "Transferor Principal", value: input.transferorPrincipalId },
+            { label: "Recipient Principal", value: input.recipientPrincipalId },
             { label: "Verifier Principal", value: DEMO_PRINCIPALS.verifier },
             { label: "Checks", value: "Instruction proof, agent signature, trace signatures, policy bundle, risk, recipient constraints" },
             { label: "Decision status", value: stage.statusLabel },
@@ -3316,7 +3786,7 @@ function getFlowStageDetailSections(
           title: "Admin Escalation Rules",
           type: "rows",
           rows: [
-            { label: "Administrator Principal", value: DEMO_PRINCIPALS.admin },
+            { label: "Administrator Principal", value: input.adminPrincipalId },
             {
               label: "When required",
               value: input.policyView
@@ -3357,8 +3827,8 @@ function getFlowStageDetailSections(
           title: "Forwarding Package",
           type: "rows",
           rows: [
-            { label: "Transferor Principal", value: DEMO_PRINCIPALS.transferor },
-            { label: "Recipient Principal", value: DEMO_PRINCIPALS.recipient },
+            { label: "Transferor Principal", value: input.transferorPrincipalId },
+            { label: "Recipient Principal", value: input.recipientPrincipalId },
             { label: "Agent Principal", value: DEMO_PRINCIPALS.agent },
             { label: "Verifier Principal", value: DEMO_PRINCIPALS.verifier },
             { label: "Routing", value: "Agent receives verifier-approved decision and forwards execution package to MCP" },
@@ -3396,8 +3866,8 @@ function getFlowStageDetailSections(
           title: "Execution Gate",
           type: "rows",
           rows: [
-            { label: "Transferor Principal", value: DEMO_PRINCIPALS.transferor },
-            { label: "Recipient Principal", value: DEMO_PRINCIPALS.recipient },
+            { label: "Transferor Principal", value: input.transferorPrincipalId },
+            { label: "Recipient Principal", value: input.recipientPrincipalId },
             { label: "Agent Principal", value: DEMO_PRINCIPALS.agent },
             { label: "Verifier Principal", value: DEMO_PRINCIPALS.verifier },
             { label: "Required input", value: "Verifier-approved decision package" },
