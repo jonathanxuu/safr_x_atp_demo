@@ -21,11 +21,17 @@ EVENT_SERVICE_URL = os.getenv("EVENT_SERVICE_URL", "http://localhost:4101")
 VERIFIER_SERVICE_URL = os.getenv("VERIFIER_SERVICE_URL", "http://localhost:4103")
 MCP_BANK_URL = os.getenv("MCP_BANK_URL", "http://localhost:4104")
 IDENTITY_SERVICE_URL = os.getenv("IDENTITY_SERVICE_URL", "http://localhost:4105")
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:4173")
+ALLOW_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("ALLOW_ORIGINS", FRONTEND_ORIGIN).split(",")
+    if origin.strip()
+]
 
 app = FastAPI(title="SAFR x ATP Agent Service")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:4173"],
+    allow_origins=ALLOW_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

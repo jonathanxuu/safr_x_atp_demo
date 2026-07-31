@@ -149,12 +149,12 @@ type FlowStage = {
   signatureSummary: string[];
 };
 
-const EVENT_SERVICE_URL = "http://localhost:4101";
-const VERIFIER_SERVICE_URL = "http://localhost:4103";
-const MCP_BANK_URL = "http://localhost:4104";
-const ARCHIVE_SERVICE_URL = "http://localhost:4102";
-const IDENTITY_SERVICE_URL = "http://localhost:4105";
-const AGENT_SERVICE_URL = "http://localhost:4106";
+const EVENT_SERVICE_URL = "/api/event";
+const VERIFIER_SERVICE_URL = "/api/verifier";
+const MCP_BANK_URL = "/api/bank";
+const ARCHIVE_SERVICE_URL = "/api/archive";
+const IDENTITY_SERVICE_URL = "/api/identity";
+const AGENT_SERVICE_URL = "/api/agent";
 
 type ActiveAccount = {
   username: string;
