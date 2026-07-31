@@ -298,7 +298,7 @@ export class IdentityRepository {
       FROM identity_passkey_credentials
       WHERE principal_id = ?
       ORDER BY created_at ASC
-    `).all(principalId) as CredentialRow[];
+    `).all(principalId) as unknown as CredentialRow[];
 
     return rows.map(mapCredentialRow);
   }

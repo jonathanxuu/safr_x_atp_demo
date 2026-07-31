@@ -590,7 +590,7 @@ export class EventRepository {
         ${whereClause}
         ORDER BY created_at ASC, id ASC
       `)
-      .all(...args) as EventEventRow[];
+      .all(...args) as unknown as EventEventRow[];
 
     return rows.map((row) => this.mapEventRow(row));
   }
@@ -791,7 +791,7 @@ export class BankRepository {
         FROM bank_accounts
         ORDER BY account_id ASC
       `)
-      .all() as BankAccountRow[];
+      .all() as unknown as BankAccountRow[];
 
     return rows.map((row) => ({
       accountId: row.account_id,
@@ -810,7 +810,7 @@ export class BankRepository {
         WHERE owner_id = ?
         ORDER BY owner_role ASC, currency ASC, account_id ASC
       `)
-      .all(ownerId) as BankAccountRow[];
+      .all(ownerId) as unknown as BankAccountRow[];
 
     return rows.map((row) => ({
       accountId: row.account_id,
@@ -874,7 +874,7 @@ export class BankRepository {
         FROM bank_transactions
         ORDER BY created_at DESC, transaction_id DESC
       `)
-      .all() as BankTransactionRow[];
+      .all() as unknown as BankTransactionRow[];
 
     return rows.map((row) => ({
       transactionId: row.transaction_id,
@@ -1104,7 +1104,7 @@ export class PrincipalKeyRepository {
         FROM principal_signing_keys
         ORDER BY role ASC, principal_id ASC
       `)
-      .all() as PrincipalSigningKeyRow[];
+      .all() as unknown as PrincipalSigningKeyRow[];
 
     return rows.map(mapPrincipalSigningKeyRow);
   }
