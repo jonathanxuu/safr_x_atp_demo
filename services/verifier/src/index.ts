@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import {
   createHash,
   createPrivateKey,
@@ -9,7 +9,6 @@ import {
   sign as signSignature,
   verify as verifySignature,
 } from "node:crypto";
-import { URL } from "node:url";
 import { DEMO_PRINCIPALS, type BaseEventEnvelope } from "@safr-x-atp-demo/protocol";
 import {
   PolicyRepository,
@@ -23,15 +22,17 @@ const eventServiceBaseUrl = process.env.EVENT_SERVICE_URL ?? "http://localhost:4
 const archiveServiceBaseUrl = process.env.ARCHIVE_SERVICE_URL ?? "http://localhost:4102";
 const identityServiceBaseUrl = process.env.IDENTITY_SERVICE_URL ?? "http://localhost:4105";
 const mcpBankBaseUrl = process.env.MCP_BANK_URL ?? "http://localhost:4104";
+const verifierDir = resolve(process.cwd(), "keys");
+const servicesDir = resolve(process.cwd(), "..");
 const agentPublicKeyPath =
   process.env.AGENT_PUBLIC_KEY_PATH ??
-  "/Users/xyz/Documents/github/safr_x_atp_demo/services/agent-service/keys/agent_ed25519_public.pem";
+  resolve(servicesDir, "agent-service", "keys", "agent_ed25519_public.pem");
 const verifierPrivateKeyPath =
   process.env.VERIFIER_PRIVATE_KEY_PATH ??
-  "/Users/xyz/Documents/github/safr_x_atp_demo/services/verifier/keys/verifier_ed25519_private.pem";
+  resolve(verifierDir, "verifier_ed25519_private.pem");
 const verifierPublicKeyPath =
   process.env.VERIFIER_PUBLIC_KEY_PATH ??
-  "/Users/xyz/Documents/github/safr_x_atp_demo/services/verifier/keys/verifier_ed25519_public.pem";
+  resolve(verifierDir, "verifier_ed25519_public.pem");
 const verifierKeyId = process.env.VERIFIER_KEY_ID ?? "verifier_demo_01#ed25519#v1";
 const registeredAgentKeyIds = new Set(
   (process.env.REGISTERED_AGENT_KEY_IDS ?? "ag_transfer_01#ed25519#v1")
