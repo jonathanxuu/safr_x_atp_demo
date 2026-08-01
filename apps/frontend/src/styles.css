@@ -537,6 +537,113 @@ button.danger {
   font-weight: 800;
 }
 
+.flowExecutionBalanceBanner {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 14px;
+  padding: 16px 18px;
+  border-radius: 18px;
+  border: 1px solid transparent;
+}
+
+.flowExecutionBalanceHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.flowExecutionBalanceHeader strong {
+  display: block;
+  font-size: 18px;
+  font-weight: 800;
+}
+
+.flowExecutionBalanceHeader span {
+  display: block;
+  margin-top: 4px;
+  font-size: 14px;
+  font-weight: 600;
+  color: inherit;
+}
+
+.flowExecutionBalanceSummary {
+  min-width: 150px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  text-align: right;
+}
+
+.flowExecutionBalanceSummary span {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.72;
+}
+
+.flowExecutionBalanceSummary strong {
+  font-size: 16px;
+  font-weight: 800;
+}
+
+.flowExecutionBalanceGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: 12px;
+  align-items: stretch;
+}
+
+.flowExecutionBalanceCard {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(134, 239, 172, 0.55);
+}
+
+.flowExecutionBalanceCard > span {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.72;
+}
+
+.flowExecutionBalanceCard strong {
+  font-size: 15px;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.flowExecutionBalanceCard small {
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.flowExecutionBalanceDelta {
+  font-weight: 700;
+}
+
+.flowExecutionBalanceDelta.up {
+  color: #166534;
+}
+
+.flowExecutionBalanceDelta.down {
+  color: #b91c1c;
+}
+
+.flowExecutionBalanceArrow {
+  align-self: center;
+  font-size: 24px;
+  font-weight: 800;
+  color: #15803d;
+  padding: 0 4px;
+}
+
 .statusTone-success {
   background: #ecfdf5;
   border-color: #86efac;

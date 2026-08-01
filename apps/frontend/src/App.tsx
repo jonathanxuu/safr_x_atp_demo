@@ -123,6 +123,19 @@ type AgentTrace = {
   }>;
 };
 
+type ExecutionBalanceSnapshot = {
+  flowId: string;
+  currency: string;
+  amount: number;
+  fromAccountId: string;
+  toAccountId: string;
+  fromBefore: number;
+  fromAfter: number;
+  toBefore: number;
+  toAfter: number;
+  alreadyExecuted: boolean;
+};
+
 type FlowStageId =
   | "instruction"
   | "agent_envelope"
@@ -328,6 +341,7 @@ export function App() {
   const [policyNotice, setPolicyNotice] = useState("");
   const [lastVerifierEventId, setLastVerifierEventId] = useState("");
   const [agentTrace, setAgentTrace] = useState<AgentTrace | null>(null);
+  const [executionBalanceSnapshot, setExecutionBalanceSnapshot] = useState<ExecutionBalanceSnapshot | null>(null);
   const [status, setStatus] = useState("Ready");
   const [instructionSubmitBusy, setInstructionSubmitBusy] = useState(false);
   const [selectedStageId, setSelectedStageId] = useState<FlowStageId | null>(null);
@@ -629,7 +643,9 @@ export function App() {
   }, [flowId]);
 
   useEffect(() => {
-    if (recipientAccount && recipientAccountRef !== recipientAccount.accountId) {
+    // Only auto-fill the default allowlisted recipient when the form is empty.
+    // Do not overwrite an explicit user choice such as the expected-reject option.
+    if (!recipientAccountRef && recipientAccount) {
       setRecipientAccountRef(recipientAccount.accountId);
     }
   }, [recipientAccount?.accountId, recipientAccountRef]);
@@ -657,6 +673,7 @@ export function App() {
     setPolicyNotice("");
     setLastVerifierEventId("");
     setAgentTrace(null);
+    setExecutionBalanceSnapshot(null);
     setEvents([]);
     setArchiveRecords([]);
     setSelectedStageId(null);
@@ -1181,6 +1198,10 @@ export function App() {
         throw new Error("Current flow is not executable yet");
       }
 
+      const fromBefore = transferorAccount.availableBalance;
+      const toBefore = recipientAccount.availableBalance;
+      const transferAmount = Number(amount);
+
       setStatus("Executing transfer in MCP bank...");
       const response = await fetch(`${AGENT_SERVICE_URL}/transfers/execute`, {
         method: "POST",
@@ -1195,10 +1216,35 @@ export function App() {
         }),
       });
 
-      const body = (await response.json()) as { alreadyExecuted?: boolean; error?: string };
+      const body = (await response.json()) as {
+        alreadyExecuted?: boolean;
+        error?: string;
+        executionEvent?: EventRecord;
+      };
       if (!response.ok) {
         throw new Error(body.error ?? "Transfer execution failed");
       }
+
+      const resultingBalances = body.executionEvent?.payload.content.resulting_balances as
+        | {
+            from_account_available_balance?: string;
+            to_account_available_balance?: string;
+          }
+        | undefined;
+      const fromAfter = Number(resultingBalances?.from_account_available_balance ?? fromBefore);
+      const toAfter = Number(resultingBalances?.to_account_available_balance ?? toBefore);
+      setExecutionBalanceSnapshot({
+        flowId,
+        currency,
+        amount: Number.isFinite(transferAmount) ? transferAmount : Number(amount || 0),
+        fromAccountId: transferorAccount.accountId,
+        toAccountId: recipientAccount.accountId,
+        fromBefore,
+        fromAfter: Number.isFinite(fromAfter) ? fromAfter : fromBefore,
+        toBefore,
+        toAfter: Number.isFinite(toAfter) ? toAfter : toBefore,
+        alreadyExecuted: Boolean(body.alreadyExecuted),
+      });
 
       setStatus(
         body.alreadyExecuted
@@ -1576,6 +1622,10 @@ export function App() {
           </div>
         ) : null}
 
+        {executionBalanceSnapshot ? (
+          <ExecutionBalanceBanner snapshot={executionBalanceSnapshot} />
+        ) : null}
+
         <div className="flowStageLane">
           <FlowRelayMap
             stages={flowStages}
@@ -1868,6 +1918,65 @@ function FlowMiniStat(props: { label: string; value: string }) {
     <div className="flowMiniStat">
       <span>{props.label}</span>
       <strong>{props.value}</strong>
+    </div>
+  );
+}
+
+function ExecutionBalanceBanner(props: { snapshot: ExecutionBalanceSnapshot }) {
+  const { snapshot } = props;
+  const fromDelta = snapshot.fromAfter - snapshot.fromBefore;
+  const toDelta = snapshot.toAfter - snapshot.toBefore;
+
+  return (
+    <div className="flowExecutionBalanceBanner statusTone-success">
+      <div className="flowExecutionBalanceHeader">
+        <div>
+          <strong>Balance update</strong>
+          <span>
+            {snapshot.alreadyExecuted ? "Execution evidence refreshed" : "Transfer executed"}
+          </span>
+        </div>
+        <div className="flowExecutionBalanceSummary">
+          <span>Flow {snapshot.flowId}</span>
+          <strong>
+            {snapshot.currency} {snapshot.amount.toFixed(2)}
+          </strong>
+        </div>
+      </div>
+
+      <div className="flowExecutionBalanceGrid">
+        <div className="flowExecutionBalanceCard">
+          <span>Transferor</span>
+          <strong>{snapshot.fromAccountId}</strong>
+          <small>
+            Before: {snapshot.currency} {snapshot.fromBefore.toFixed(2)}
+          </small>
+          <small>
+            After: {snapshot.currency} {snapshot.fromAfter.toFixed(2)}
+          </small>
+          <small className={`flowExecutionBalanceDelta ${fromDelta <= 0 ? "down" : "up"}`}>
+            Change: {fromDelta > 0 ? "+" : ""}
+            {snapshot.currency} {fromDelta.toFixed(2)}
+          </small>
+        </div>
+
+        <div className="flowExecutionBalanceArrow">→</div>
+
+        <div className="flowExecutionBalanceCard">
+          <span>Recipient</span>
+          <strong>{snapshot.toAccountId}</strong>
+          <small>
+            Before: {snapshot.currency} {snapshot.toBefore.toFixed(2)}
+          </small>
+          <small>
+            After: {snapshot.currency} {snapshot.toAfter.toFixed(2)}
+          </small>
+          <small className={`flowExecutionBalanceDelta ${toDelta >= 0 ? "up" : "down"}`}>
+            Change: {toDelta >= 0 ? "+" : ""}
+            {snapshot.currency} {toDelta.toFixed(2)}
+          </small>
+        </div>
+      </div>
     </div>
   );
 }
