@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+import os
+import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .constants import DEMO_PRINCIPALS
+
+
+SHARED_DB_PATH = Path(
+    os.getenv(
+        "SHARED_DB_PATH",
+        str(Path(__file__).resolve().parents[3] / "data" / "safr-atp-demo.sqlite"),
+    )
+)
 
 
 @dataclass
@@ -29,7 +40,7 @@ class GovernedTransferSkill:
         allowed_currencies = [str(item) for item in policy.get("allowedCurrencies", ["USD"])]
         recipient_allowlist_required = bool(policy.get("recipientAllowlistRequired", True))
         amount_value = self._safe_amount(amount)
-        recipient_allowlisted = recipient_account_ref == "acct_recipient_bob_001"
+        recipient_allowlisted = self._is_allowlisted_recipient(recipient_id, recipient_account_ref)
 
         policy_decision = self._compute_policy_decision(
             amount_value=amount_value,
@@ -118,3 +129,26 @@ class GovernedTransferSkill:
             return float(value)
         except Exception:
             return 0.0
+
+    def _is_allowlisted_recipient(self, recipient_id: str, recipient_account_ref: str) -> bool:
+        if not recipient_id or not recipient_account_ref:
+            return False
+
+        try:
+            with sqlite3.connect(SHARED_DB_PATH) as connection:
+                row = connection.execute(
+                    """
+                    SELECT owner_id, owner_role
+                    FROM bank_accounts
+                    WHERE account_id = ?
+                    """,
+                    (recipient_account_ref,),
+                ).fetchone()
+        except Exception:
+            return False
+
+        if not row:
+            return False
+
+        owner_id, owner_role = row
+        return owner_id == recipient_id and owner_role == "recipient"
