@@ -16,6 +16,11 @@ set -a
 source "$ROOT_DIR/.env.server"
 set +a
 
+# Server deployments should always use Vertex AI for ADK.
+# Keep a safe default here so an older .env.server cannot accidentally
+# fall back to Gemini API key mode and fail with "No API key was provided".
+export GOOGLE_GENAI_USE_VERTEXAI="${GOOGLE_GENAI_USE_VERTEXAI:-true}"
+
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "Missing required command: $1" >&2
