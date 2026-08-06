@@ -2,7 +2,7 @@
 
 Monorepo for a decoupled SAFR x ATP transfer demo built around the flow:
 
-`Kind 101 instruction -> Kind 102 envelope -> verifier -> admin signature -> re-verifier -> MCP bank`
+`Kind 101 transfer instruction -> Kind 102 governance envelope -> Kind 103/104 verifier decision -> Kind 105 administrator authorization -> Kind 107 re-verification -> Kind 109 automatic MCP execution`
 
 ## Modules
 

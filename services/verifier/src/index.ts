@@ -682,7 +682,7 @@ function createVerifierEnvelope(
     id: `evt_verifier_${idSuffix}_${Date.now()}_hash`,
     kind,
     ai_id: aiId,
-    created_at: Math.floor(Date.now() / 1000),
+    created_at: Date.now(),
     tags: [
       ["flow_id", flowId],
       ["source", "verifier"],

@@ -1,6 +1,9 @@
 import { startAuthentication, startRegistration } from "@simplewebauthn/browser";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { RefObject } from "react";
 import { DEMO_AGENT_IDS, DEMO_PRINCIPALS, assertEnglishAccountHandle } from "@safr-x-atp-demo/protocol";
+
+declare const __GOOGLE_ADK_MODEL__: string;
 
 type Account = {
   accountId: string;
@@ -162,12 +165,15 @@ type FlowStage = {
   signatureSummary: string[];
 };
 
+type AppTabId = "overview" | "transfer" | "agent" | "verifier" | "policy" | "trace" | "archive";
+
 const EVENT_SERVICE_URL = "/api/event";
 const VERIFIER_SERVICE_URL = "/api/verifier";
 const MCP_BANK_URL = "/api/bank";
 const ARCHIVE_SERVICE_URL = "/api/archive";
 const IDENTITY_SERVICE_URL = "/api/identity";
 const AGENT_SERVICE_URL = "/api/agent";
+const FLOW_SNAPSHOT_STORAGE_KEY = "safr_x_atp_demo:last_flow_snapshot";
 
 type ActiveAccount = {
   username: string;
@@ -197,6 +203,81 @@ async function fetchIdentity(path: string, init: RequestInit = {}) {
       ...(init.headers ?? {}),
     },
   });
+}
+
+type PersistedFlowSnapshot = {
+  flowId: string;
+  activeTab: AppTabId;
+  amount: string;
+  currency: string;
+  memo: string;
+  recipientAccountRef: string;
+  amountError: string;
+  status: string;
+  lastVerifierEventId: string;
+  agentTrace: AgentTrace | null;
+  executionBalanceSnapshot: ExecutionBalanceSnapshot | null;
+  events: EventRecord[];
+  archiveRecords: ArchiveRecord[];
+  selectedStageId: FlowStageId | null;
+  overviewPreviewStageId: FlowStageId | null;
+  spotlightStageId: FlowStageId;
+};
+
+function readPersistedFlowSnapshot(): PersistedFlowSnapshot | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  try {
+    const raw = window.localStorage.getItem(FLOW_SNAPSHOT_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(raw) as Partial<PersistedFlowSnapshot>;
+    if (!parsed.flowId) {
+      return null;
+    }
+
+    return {
+      flowId: parsed.flowId,
+      activeTab: parsed.activeTab ?? "overview",
+      amount: parsed.amount ?? "",
+      currency: parsed.currency ?? "USD",
+      memo: parsed.memo ?? "",
+      recipientAccountRef: parsed.recipientAccountRef ?? "",
+      amountError: parsed.amountError ?? "",
+      status: parsed.status ?? "Ready",
+      lastVerifierEventId: parsed.lastVerifierEventId ?? "",
+      agentTrace: parsed.agentTrace ?? null,
+      executionBalanceSnapshot: parsed.executionBalanceSnapshot ?? null,
+      events: Array.isArray(parsed.events) ? (parsed.events as EventRecord[]) : [],
+      archiveRecords: Array.isArray(parsed.archiveRecords) ? (parsed.archiveRecords as ArchiveRecord[]) : [],
+      selectedStageId: parsed.selectedStageId ?? null,
+      overviewPreviewStageId: parsed.overviewPreviewStageId ?? null,
+      spotlightStageId: parsed.spotlightStageId ?? "instruction",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writePersistedFlowSnapshot(snapshot: PersistedFlowSnapshot | null) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  try {
+    if (!snapshot) {
+      window.localStorage.removeItem(FLOW_SNAPSHOT_STORAGE_KEY);
+      return;
+    }
+
+    window.localStorage.setItem(FLOW_SNAPSHOT_STORAGE_KEY, JSON.stringify(snapshot));
+  } catch {
+    // Ignore storage failures in the demo UI.
+  }
 }
 
 function evaluatePasswordStrength(password: string): PasswordStrength {
@@ -320,48 +401,137 @@ function getAmountValidationMessage(value: string, availableBalance: number | nu
 }
 
 export function App() {
+  const persistedFlowSnapshot = readPersistedFlowSnapshot();
   const [authReady, setAuthReady] = useState(false);
   const [activeAccount, setActiveAccount] = useState<ActiveAccount | null>(null);
   const [accountUsernameInput, setAccountUsernameInput] = useState("");
   const [accountPasswordInput, setAccountPasswordInput] = useState("");
   const [authError, setAuthError] = useState("");
-  const [flowId, setFlowId] = useState(() => `flow_demo_${Date.now()}`);
-  const [amount, setAmount] = useState("");
-  const [currency, setCurrency] = useState("USD");
-  const [memo, setMemo] = useState("");
-  const [recipientAccountRef, setRecipientAccountRef] = useState("");
-  const [amountError, setAmountError] = useState("");
+  const [flowId, setFlowId] = useState(() => persistedFlowSnapshot?.flowId ?? `flow_demo_${Date.now()}`);
+  const [amount, setAmount] = useState(() => persistedFlowSnapshot?.amount ?? "");
+  const [currency, setCurrency] = useState(() => persistedFlowSnapshot?.currency ?? "USD");
+  const [memo, setMemo] = useState(() => persistedFlowSnapshot?.memo ?? "");
+  const [recipientAccountRef, setRecipientAccountRef] = useState(
+    () => persistedFlowSnapshot?.recipientAccountRef ?? "",
+  );
+  const [amountError, setAmountError] = useState(() => persistedFlowSnapshot?.amountError ?? "");
   const [passkeyTransferor, setPasskeyTransferor] = useState<PasskeyState>(createEmptyPasskeyState);
   const [passkeyAdmin, setPasskeyAdmin] = useState<PasskeyState>(createEmptyPasskeyState);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
-  const [events, setEvents] = useState<EventRecord[]>([]);
-  const [archiveRecords, setArchiveRecords] = useState<ArchiveRecord[]>([]);
+  const [events, setEvents] = useState<EventRecord[]>(() => persistedFlowSnapshot?.events ?? []);
+  const [archiveRecords, setArchiveRecords] = useState<ArchiveRecord[]>(
+    () => persistedFlowSnapshot?.archiveRecords ?? [],
+  );
   const [policyView, setPolicyView] = useState<VerifierPolicyView | null>(null);
   const [policyNotice, setPolicyNotice] = useState("");
-  const [lastVerifierEventId, setLastVerifierEventId] = useState("");
-  const [agentTrace, setAgentTrace] = useState<AgentTrace | null>(null);
-  const [executionBalanceSnapshot, setExecutionBalanceSnapshot] = useState<ExecutionBalanceSnapshot | null>(null);
-  const [status, setStatus] = useState("Ready");
+  const [lastVerifierEventId, setLastVerifierEventId] = useState(
+    () => persistedFlowSnapshot?.lastVerifierEventId ?? "",
+  );
+  const [agentTrace, setAgentTrace] = useState<AgentTrace | null>(() => persistedFlowSnapshot?.agentTrace ?? null);
+  const [executionBalanceSnapshot, setExecutionBalanceSnapshot] = useState<ExecutionBalanceSnapshot | null>(
+    () => persistedFlowSnapshot?.executionBalanceSnapshot ?? null,
+  );
+  const [executionSuccessModalOpen, setExecutionSuccessModalOpen] = useState(false);
+  const [status, setStatus] = useState(() => persistedFlowSnapshot?.status ?? "Ready");
+  const [restoreConfirmArmed, setRestoreConfirmArmed] = useState(false);
+  const [restoreNotice, setRestoreNotice] = useState("");
+  const [switchConfirmArmed, setSwitchConfirmArmed] = useState(false);
   const [instructionSubmitBusy, setInstructionSubmitBusy] = useState(false);
-  const [selectedStageId, setSelectedStageId] = useState<FlowStageId | null>(null);
-  const [spotlightStageId, setSpotlightStageId] = useState<FlowStageId>("instruction");
+  const [selectedStageId, setSelectedStageId] = useState<FlowStageId | null>(
+    () => persistedFlowSnapshot?.selectedStageId ?? null,
+  );
+  const [overviewPreviewStageId, setOverviewPreviewStageId] = useState<FlowStageId | null>(
+    () => persistedFlowSnapshot?.overviewPreviewStageId ?? null,
+  );
+  const [spotlightStageId, setSpotlightStageId] = useState<FlowStageId>(
+    () => persistedFlowSnapshot?.spotlightStageId ?? "instruction",
+  );
   const [actionPulseStageId, setActionPulseStageId] = useState<FlowStageId | null>(null);
   const [instructionComposerOpen, setInstructionComposerOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState<AppTabId>(() => persistedFlowSnapshot?.activeTab ?? "overview");
+  const [workflowScrollPending, setWorkflowScrollPending] = useState(false);
+  const [accountPanelOpen, setAccountPanelOpen] = useState(false);
+  const [showPasskeySuccessToast, setShowPasskeySuccessToast] = useState(false);
+  const [transferFailureModalOpen, setTransferFailureModalOpen] = useState(false);
+  const [transferFailureVerifierEvent, setTransferFailureVerifierEvent] = useState<EventRecord | null>(null);
+  const [archiveDetailOpen, setArchiveDetailOpen] = useState(false);
+  const [archiveDetailLoading, setArchiveDetailLoading] = useState(false);
+  const [archiveDetailError, setArchiveDetailError] = useState("");
+  const [archiveDetailTransaction, setArchiveDetailTransaction] = useState<Transaction | null>(null);
+  const [archiveDetailRecords, setArchiveDetailRecords] = useState<ArchiveRecord[]>([]);
+  const [adminReviewPromptOpen, setAdminReviewPromptOpen] = useState(false);
+  const accountPanelRef = useRef<HTMLDivElement | null>(null);
+  const workflowPanelRef = useRef<HTMLElement | null>(null);
+  const workflowAdminCueRef = useRef<HTMLDivElement | null>(null);
+  const workflowBottomRef = useRef<HTMLDivElement | null>(null);
+  const transferorRegisterButtonRef = useRef<HTMLButtonElement | null>(null);
+  const adminRegisterButtonRef = useRef<HTMLButtonElement | null>(null);
+  const archiveDetailRequestRef = useRef(0);
+  const previousMissingPasskeyCountRef = useRef(0);
+  const autoExecutionAttemptRef = useRef<string | null>(null);
   const passwordStrength = evaluatePasswordStrength(accountPasswordInput);
+
+  function createFlowId() {
+    return `flow_demo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  }
 
   const transferorPrincipalId = activeAccount?.transferorPrincipalId ?? DEMO_PRINCIPALS.transferor;
   const adminPrincipalId = activeAccount?.adminPrincipalId ?? DEMO_PRINCIPALS.admin;
   const recipientPrincipalId = activeAccount?.recipientPrincipalId ?? DEMO_PRINCIPALS.recipient;
   const activeUsername = activeAccount?.username ?? "";
   const activeAccountLabel = activeUsername || "demo";
+  const passkeySetupIncomplete = !passkeyTransferor.registered || !passkeyAdmin.registered;
+  const showPasskeyOnboarding = passkeySetupIncomplete;
+  const missingPasskeyRoles = [
+    !passkeyTransferor.registered ? "Transferor passkey" : null,
+    !passkeyAdmin.registered ? "Administrator passkey" : null,
+  ].filter(Boolean) as string[];
 
   const transferorAccount = accounts.find(
     (account) => account.ownerId === transferorPrincipalId && account.ownerRole === "transferor",
   );
-  const recipientAccount = accounts.find(
+  const allowlistedRecipientAccount = accounts.find(
     (account) => account.ownerId === recipientPrincipalId && account.ownerRole === "recipient",
   );
+  const selectedRecipientAccount = accounts.find((account) => account.accountId === recipientAccountRef) ?? null;
+  const currentAccountIds = Array.from(
+    new Set(
+      [transferorAccount?.accountId, allowlistedRecipientAccount?.accountId].filter(
+        (accountId): accountId is string => Boolean(accountId),
+      ),
+    ),
+  );
+  const archiveTransactions = transactions
+    .filter(
+      (transaction) =>
+        transaction.status === "executed" &&
+        (currentAccountIds.includes(transaction.fromAccountId) ||
+          currentAccountIds.includes(transaction.toAccountId)),
+    )
+    .slice()
+    .sort(
+      (left, right) =>
+        new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime() ||
+        right.transactionId.localeCompare(left.transactionId),
+    );
+  const archiveGroupedTransactions = archiveTransactions.reduce<
+    Array<{ monthKey: string; monthLabel: string; items: Transaction[] }>
+  >((groups, transaction) => {
+    const monthKey = transaction.createdAt.slice(0, 7);
+    const currentGroup = groups.at(-1);
+
+    if (!currentGroup || currentGroup.monthKey !== monthKey) {
+      groups.push({
+        monthKey,
+        monthLabel: formatArchiveMonthLabel(monthKey),
+        items: [],
+      });
+    }
+
+    groups.at(-1)?.items.push(transaction);
+    return groups;
+  }, []);
   const threshold = policyView?.policy.adminReviewAtOrAbove ?? 1000;
   const transferorAvailableBalance = transferorAccount?.availableBalance ?? null;
   const normalizedAmount = normalizeAmountInput(amount);
@@ -384,10 +554,11 @@ export function App() {
   const canExecute = Boolean(
     lastVerifierEventId && (!requiresAdmin ? firstVerifierEvent?.kind === 103 : reverifyEvent),
   );
-  const isDraft =
+  const isFlowEmpty =
     !instructionEvent && !envelopeEvent && !firstVerifierEvent && !reverifyEvent && !executionEvent;
   const isWaitingForFirstVerifier = Boolean(envelopeEvent && !firstVerifierEvent && !rejectEvent);
   const isWaitingForAdmin = requiresAdmin && firstVerifierEvent?.kind === 104 && !reverifyEvent;
+  const canAdminApprove = Boolean(passkeyAdmin.registered && isWaitingForAdmin && !executionEvent);
   const isReadyForExecution = canExecute && !executionEvent;
   const activeVerifierEvent =
     reverifyEvent ??
@@ -412,10 +583,10 @@ export function App() {
       : isWaitingForAdmin
         ? "Administrator passkey signature required"
         : isReadyForExecution
-          ? "Forward approved package to MCP bank"
+          ? "Automatic MCP execution in progress"
           : isWaitingForFirstVerifier
             ? "Verifier is evaluating the agent envelope"
-            : isDraft
+            : isFlowEmpty
               ? "Capture and sign a new human instruction"
               : "Transferor should submit this instruction to verifier";
   const currentActionHint = executionEvent
@@ -425,13 +596,271 @@ export function App() {
       : isWaitingForAdmin
         ? "This amount crossed the policy threshold, so admin passkey approval is the next mandatory step."
         : isReadyForExecution
-          ? "Verifier approval is complete. The agent can now relay the approved execution package."
+          ? "Verifier approval is complete. After the check passes, the agent automatically relays the package for MCP execution."
           : isWaitingForFirstVerifier
             ? "The signed instruction and agent envelope were already submitted. Wait for the verifier decision."
             : "You can operate directly from this strip without scrolling away from the live governance diagram.";
   const selectedStage = selectedStageId
     ? flowStages.find((stage) => stage.id === selectedStageId) ?? null
     : null;
+  const overviewPreviewStage = overviewPreviewStageId
+    ? flowStages.find((stage) => stage.id === overviewPreviewStageId) ?? null
+    : null;
+  const flowStatusLabel = executionEvent
+    ? "Executed"
+    : rejectEvent
+      ? "Rejected"
+      : reverifyEvent
+        ? "Re-verified"
+        : firstVerifierEvent?.kind === 104
+          ? "Admin Review"
+          : firstVerifierEvent?.kind === 103
+            ? "Verifier Approved"
+            : envelopeEvent
+              ? "In Verification"
+              : instructionEvent
+                ? "At Agent"
+                : "Not started";
+  const currentStateSummary = passkeySetupIncomplete
+    ? "Passkey setup needed"
+    : executionEvent
+      ? "Flow executed"
+      : canExecute
+        ? "Auto execution ready"
+        : "Ready to transfer";
+  const verifierTabDecisionLabel = !instructionEvent
+    ? "No transfer yet"
+    : rejectEvent
+      ? "Rejected"
+      : isWaitingForAdmin
+        ? "Admin review required"
+        : isReadyForExecution
+          ? "Approved"
+          : firstVerifierEvent?.kind === 103
+            ? "Approved"
+            : firstVerifierEvent?.kind === 104
+              ? "Escalated"
+              : firstVerifierEvent?.kind === 108
+                ? "Rejected"
+                : "Under review";
+  const verifierTabNextStep = !instructionEvent
+    ? "Start a transfer first. The verifier only appears once a signed instruction has been submitted."
+    : rejectEvent
+      ? "Review the rejected step in Trace to see the reason and evidence."
+      : isWaitingForAdmin
+        ? "The verifier has escalated this flow. The next step is an administrator passkey signature."
+        : isReadyForExecution
+          ? "The verifier approved the flow. The agent now forwards it to MCP automatically."
+          : firstVerifierEvent?.kind === 103
+            ? "The verifier approved the instruction and the flow can move forward."
+            : "The verifier is checking the signed instruction, recipient, and policy lane.";
+  const sidebarTabs: Array<{
+    id: AppTabId;
+    label: string;
+    hint: string;
+    attention?: boolean;
+  }> = [
+    {
+      id: "overview",
+      label: "Overview",
+      hint: "See the full governed transfer path",
+    },
+    {
+      id: "transfer",
+      label: "Transfer",
+      hint: "Start and submit a human transfer instruction",
+    },
+    {
+      id: "agent",
+      label: "Agent",
+      hint: "Review Gemini Enterprise Agent Platform context",
+    },
+    {
+      id: "verifier",
+      label: "Verifier",
+      hint: "See the decision layer and approval logic",
+    },
+    {
+      id: "policy",
+      label: "Policy",
+      hint: "Review threshold and allowlist behavior",
+    },
+    {
+      id: "trace",
+      label: "Trace",
+      hint: "Inspect stages, events, and archive checkpoints",
+    },
+    {
+      id: "archive",
+      label: "Archive",
+      hint: "Review successful transfers and archive event details",
+    },
+  ];
+  const currentTabLabel = sidebarTabs.find((tab) => tab.id === activeTab)?.label ?? "Overview";
+  const currentTabDescription = (() => {
+    switch (activeTab) {
+      case "overview":
+        return "Start here for a quick product summary, then jump into transfer, policy, or trace when needed.";
+      case "transfer":
+        return "Start a transfer instruction, sign it, and hand it to the agent.";
+      case "agent":
+        return agentTrace
+          ? "Review the Gemini Enterprise Agent Platform prompt, checks, tools, and run details for this transfer."
+          : "No transfer instruction has been submitted yet, so the agent has not started.";
+      case "verifier":
+        return activeVerifierEvent
+          ? "See how the verifier reviewed the signed instruction, applied policy, and decided what happens next."
+          : "No transfer instruction has been submitted yet, so the verifier has not started.";
+      case "policy":
+        return "Review the active governance bundle, threshold, and allowlist behavior.";
+      case "trace":
+        return "See how a transfer moves from signature to execution, with evidence available when you need it.";
+      case "archive":
+        return "Review completed transfer history for the current account and open each archive event for a quick overview.";
+      default:
+        return "See how a transfer moves from signature to execution, with evidence available when you need it.";
+    }
+  })();
+  const agentModelName = __GOOGLE_ADK_MODEL__ || "gemini-3.5-flash-lite";
+  const hasAgentRun = Boolean(agentTrace && instructionEvent);
+  const signedEnvelopeView = getSignedEnvelopeView(envelopeEvent);
+  const recipientAllowlisted = Boolean(
+    selectedRecipientAccount &&
+      selectedRecipientAccount.ownerId === recipientPrincipalId &&
+      selectedRecipientAccount.ownerRole === "recipient",
+  );
+  const recipientHint = !recipientAccountRef
+    ? "Choose a recipient"
+    : !recipientAllowlisted
+      ? "This transfer will be rejected at verifier validation."
+      : `Selected: ${recipientAccountRef}`;
+  const amountBelowThreshold = Number.isFinite(parsedAmount) && parsedAmount < threshold;
+  const verifierCheckViews: Array<{
+    label: string;
+    detail: string;
+    tone: "pass" | "warn" | "fail";
+  }> = [
+    {
+      label: "Recipient is allowlisted",
+      detail: recipientAllowlisted
+        ? `Resolved to ${selectedRecipientAccount?.accountId || recipientAccountRef} and passed the allowlist check.`
+        : "The selected recipient does not match the allowlisted recipient account.",
+      tone: recipientAllowlisted ? "pass" : "fail",
+    },
+    {
+      label: "Amount stays below the policy threshold",
+      detail: Number.isFinite(parsedAmount)
+        ? amountBelowThreshold
+          ? `${currency} ${parsedAmount.toFixed(2)} stays below ${currency} ${threshold.toFixed(2)}.`
+          : `${currency} ${parsedAmount.toFixed(2)} reaches or exceeds the policy threshold.`
+        : "Set an amount to evaluate the policy lane.",
+      tone: Number.isFinite(parsedAmount) ? (amountBelowThreshold ? "pass" : "warn") : "warn",
+    },
+  ];
+  const traceDigestCards = [
+    {
+      eyebrow: "Model",
+      title: agentModelName,
+      summary: hasAgentRun
+        ? "Gemini Enterprise Agent Platform already handled this transfer."
+        : "No transfer instruction exists yet, so the agent stays idle.",
+      meta: hasAgentRun
+        ? `${agentTrace?.mandatoryTools?.length ?? 0} checks · ${agentTrace?.toolCalls.length ?? 0} tools`
+        : "No transfer submitted yet",
+      status: hasAgentRun ? "done" : "pending",
+    },
+    {
+      eyebrow: "History",
+      title: executionBalanceSnapshot ? "Balances updated" : "Archive ready",
+      summary: executionBalanceSnapshot
+        ? "The sender and recipient balances were updated, and the result was archived."
+        : "Every completed flow is kept in the archive for later review.",
+      meta: executionBalanceSnapshot
+        ? `${executionBalanceSnapshot.currency} ${executionBalanceSnapshot.amount.toFixed(2)} transferred`
+        : `${archiveRecords.length} archived checkpoints`,
+      status: executionBalanceSnapshot ? "done" : archiveRecords.length > 0 ? "current" : "pending",
+    },
+  ] as const;
+  const traceJourneyCards = [
+    {
+      step: "1",
+      tone: "transferor" as const,
+      title: "Instruction signed",
+      summary: instructionEvent
+        ? "The transferor used a passkey to confirm the payment instruction."
+        : "No transfer has been started yet.",
+      meta: instructionEvent ? "Signed instruction" : "Ready for signature",
+      status: instructionEvent ? "done" : "current",
+      statusLabel: instructionEvent ? "Done" : "Active",
+      stageId: "instruction" as FlowStageId,
+    },
+    {
+      step: "2",
+      tone: "agent" as const,
+      title: "Agent prepares transfer",
+      summary: envelopeEvent
+        ? "The agent wrapped the instruction and passed it to the verifier."
+        : "The agent starts after a signed instruction is submitted.",
+      meta: envelopeEvent ? "Prepared package" : "Not started yet",
+      status: envelopeEvent ? "done" : instructionEvent ? "current" : "pending",
+      statusLabel: envelopeEvent ? "Done" : instructionEvent ? "Active" : "Up next",
+      stageId: "agent_envelope" as FlowStageId,
+    },
+    {
+      step: "3",
+      tone: requiresAdmin ? ("admin" as const) : ("verifier" as const),
+      title: requiresAdmin ? "Admin confirmation branch" : "Verifier decision",
+      summary: requiresAdmin
+        ? adminApprovalEvent || reverifyEvent
+          ? "This higher-value transfer has entered the admin branch and is ready for re-check."
+          : "This transfer is above the threshold, so it branches to a second admin confirmation before execution."
+        : "The verifier approved the transfer without an extra admin step.",
+      meta: requiresAdmin ? "Conditional branch" : "Auto lane",
+      status: requiresAdmin
+        ? adminApprovalEvent || reverifyEvent
+          ? "done"
+          : "current"
+        : firstVerifierEvent
+          ? "done"
+          : envelopeEvent
+            ? "current"
+            : "pending",
+      statusLabel: requiresAdmin
+        ? adminApprovalEvent || reverifyEvent
+          ? "Done"
+          : "Active"
+        : firstVerifierEvent
+          ? "Done"
+          : envelopeEvent
+            ? "Active"
+            : "Up next",
+      stageId: (requiresAdmin ? "admin" : "verifier") as FlowStageId,
+    },
+    {
+      step: "4",
+      tone: "mcp" as const,
+      title: requiresAdmin ? "Re-check then settle" : "Payment completes",
+      summary: executionEvent
+        ? "The bank completed the transfer and the archive saved the final checkpoint."
+        : requiresAdmin
+          ? "After admin confirmation, the verifier re-checks the packet and the bank settles automatically."
+          : "The flow finishes here automatically once approval clears.",
+      meta: executionEvent ? "Settled" : requiresAdmin ? "After re-check" : "Auto after check",
+      status: executionEvent ? "done" : reverifyEvent || firstVerifierEvent?.kind === 103 ? "current" : "pending",
+      statusLabel: executionEvent
+        ? "Done"
+        : requiresAdmin
+          ? reverifyEvent
+            ? "In progress"
+            : adminApprovalEvent
+              ? "Re-check pending"
+              : "Awaiting admin"
+          : reverifyEvent || firstVerifierEvent?.kind === 103
+            ? "In progress"
+            : "Up next",
+      stageId: executionEvent ? "execution" : "archive",
+    },
+  ] as const;
 
   useEffect(() => {
     let cancelled = false;
@@ -589,16 +1018,26 @@ export function App() {
     setTransactions(body.transactions);
   }
 
-  async function fetchEvents() {
-    const response = await fetch(`${EVENT_SERVICE_URL}/events?flowId=${flowId}`);
+  async function fetchEvents(targetFlowId = flowId) {
+    const response = await fetch(`${EVENT_SERVICE_URL}/events?flowId=${targetFlowId}`);
     const body = (await response.json()) as { events: EventRecord[] };
     setEvents(body.events);
   }
 
-  async function fetchArchive() {
-    const response = await fetch(`${ARCHIVE_SERVICE_URL}/archive/flows/${flowId}`);
-    const body = (await response.json()) as { records: ArchiveRecord[] };
-    setArchiveRecords(body.records ?? []);
+  async function fetchArchiveRecordsForFlow(targetFlowId: string) {
+    const response = await fetch(`${ARCHIVE_SERVICE_URL}/archive/flows/${targetFlowId}`);
+    const body = (await response.json()) as { records: ArchiveRecord[]; error?: string; detail?: string };
+
+    if (!response.ok) {
+      throw new Error(body.error ?? body.detail ?? "Failed to load archive records");
+    }
+
+    return body.records ?? [];
+  }
+
+  async function fetchArchive(targetFlowId = flowId) {
+    const records = await fetchArchiveRecordsForFlow(targetFlowId);
+    setArchiveRecords(records);
   }
 
   async function fetchPolicy() {
@@ -623,12 +1062,12 @@ export function App() {
     setPolicyNotice("");
   }
 
-  async function refreshAll() {
+  async function refreshAll(targetFlowId = flowId) {
     await Promise.all([
       fetchAccounts(),
       fetchTransactions(),
-      fetchEvents(),
-      fetchArchive(),
+      fetchEvents(targetFlowId),
+      fetchArchive(targetFlowId),
       fetchPolicy(),
       refreshPasskeys(),
     ]);
@@ -643,14 +1082,6 @@ export function App() {
   }, [flowId]);
 
   useEffect(() => {
-    // Only auto-fill the default allowlisted recipient when the form is empty.
-    // Do not overwrite an explicit user choice such as the expected-reject option.
-    if (!recipientAccountRef && recipientAccount) {
-      setRecipientAccountRef(recipientAccount.accountId);
-    }
-  }, [recipientAccount?.accountId, recipientAccountRef]);
-
-  useEffect(() => {
     void fetchPolicy();
   }, []);
 
@@ -662,7 +1093,158 @@ export function App() {
     void refreshPasskeys();
   }, [activeAccount?.username, transferorPrincipalId, adminPrincipalId]);
 
-  function resetTransferForm(nextFlowId = `flow_demo_${Date.now()}`) {
+  useEffect(() => {
+    writePersistedFlowSnapshot({
+      flowId,
+      activeTab,
+      amount,
+      currency,
+      memo,
+      recipientAccountRef,
+      amountError,
+      status,
+      lastVerifierEventId,
+      agentTrace,
+      executionBalanceSnapshot,
+      events,
+      archiveRecords,
+      selectedStageId,
+      overviewPreviewStageId,
+      spotlightStageId,
+    });
+  }, [
+    flowId,
+    activeTab,
+    amount,
+    currency,
+    memo,
+    recipientAccountRef,
+    amountError,
+    status,
+    lastVerifierEventId,
+    agentTrace,
+    executionBalanceSnapshot,
+    events,
+    archiveRecords,
+    selectedStageId,
+    overviewPreviewStageId,
+    spotlightStageId,
+  ]);
+
+  useEffect(() => {
+    const currentMissingCount = missingPasskeyRoles.length;
+    const previousMissingCount = previousMissingPasskeyCountRef.current;
+
+    if (
+      accountPanelOpen &&
+      currentMissingCount > 0 &&
+      previousMissingCount > currentMissingCount
+    ) {
+      const nextMissingButton =
+        !passkeyTransferor.registered ? transferorRegisterButtonRef.current : adminRegisterButtonRef.current;
+      nextMissingButton?.focus();
+      nextMissingButton?.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "smooth" });
+    }
+
+    if (activeAccount && previousMissingCount > 0 && currentMissingCount === 0) {
+      setShowPasskeySuccessToast(true);
+    }
+
+    previousMissingPasskeyCountRef.current = currentMissingCount;
+  }, [
+    accountPanelOpen,
+    activeAccount,
+    missingPasskeyRoles.length,
+    passkeyTransferor.registered,
+    passkeyAdmin.registered,
+  ]);
+
+  useEffect(() => {
+    if (!showPasskeySuccessToast) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setShowPasskeySuccessToast(false);
+    }, 2600);
+
+    return () => window.clearTimeout(timer);
+  }, [showPasskeySuccessToast]);
+
+  useEffect(() => {
+    if (!isReadyForExecution || executionEvent || !lastVerifierEventId) {
+      return;
+    }
+
+    if (autoExecutionAttemptRef.current === lastVerifierEventId) {
+      return;
+    }
+
+    autoExecutionAttemptRef.current = lastVerifierEventId;
+    pulseAndRun("execution", () => void handleExecuteTransfer());
+  }, [executionEvent, isReadyForExecution, lastVerifierEventId]);
+
+  useEffect(() => {
+    if (!workflowScrollPending || activeTab !== "transfer") {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      if (isWaitingForAdmin) {
+        workflowAdminCueRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+      } else {
+        workflowBottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+      }
+      setWorkflowScrollPending(false);
+    }, 0);
+
+    return () => window.clearTimeout(timer);
+  }, [activeTab, isWaitingForAdmin, workflowScrollPending]);
+
+  useEffect(() => {
+    if (!authReady || !activeAccount || passkeySetupIncomplete) {
+      return;
+    }
+
+    setStatus((current) =>
+      current === "Account registered" || current === "Logged in"
+        ? "Passkey setup complete. You can now continue with the transfer flow."
+        : current,
+    );
+  }, [authReady, activeAccount, passkeySetupIncomplete]);
+
+  useEffect(() => {
+    if (!accountPanelOpen) {
+      setRestoreConfirmArmed(false);
+      setRestoreNotice("");
+      setSwitchConfirmArmed(false);
+      return;
+    }
+
+    function handlePointerDown(event: MouseEvent) {
+      if (!accountPanelRef.current?.contains(event.target as Node)) {
+        setAccountPanelOpen(false);
+      }
+    }
+
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, [accountPanelOpen]);
+
+  useEffect(() => {
+    if (!restoreConfirmArmed) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setRestoreConfirmArmed(false);
+      setRestoreNotice("");
+    }, 4000);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [restoreConfirmArmed]);
+
+  function resetTransferForm(nextFlowId = createFlowId()) {
     setFlowId(nextFlowId);
     setAmount("");
     setAmountError("");
@@ -674,6 +1256,9 @@ export function App() {
     setLastVerifierEventId("");
     setAgentTrace(null);
     setExecutionBalanceSnapshot(null);
+    setExecutionSuccessModalOpen(false);
+    setTransferFailureModalOpen(false);
+    setTransferFailureVerifierEvent(null);
     setEvents([]);
     setArchiveRecords([]);
     setSelectedStageId(null);
@@ -681,12 +1266,25 @@ export function App() {
     setStatus("Ready");
     setActionPulseStageId(null);
     setInstructionSubmitBusy(false);
+    setWorkflowScrollPending(false);
+    setAdminReviewPromptOpen(false);
+    autoExecutionAttemptRef.current = null;
   }
 
-  function startNewFlowDraft() {
+  function startNewFlow() {
     resetTransferForm();
     void fetchPolicy();
+    setActiveTab("transfer");
     setInstructionComposerOpen(true);
+  }
+
+  function handleTransferPrimaryAction() {
+    if (isFlowEmpty) {
+      setInstructionComposerOpen(true);
+      return;
+    }
+
+    startNewFlow();
   }
 
   async function handleEnterAccount(action: "register" | "login") {
@@ -727,6 +1325,8 @@ export function App() {
       setPasskeyAdmin(createEmptyPasskeyState());
       setAccountPasswordInput("");
       resetTransferForm();
+      setActiveTab("overview");
+      setAccountPanelOpen(false);
       setAccountUsernameInput(body.account.username);
       setStatus(action === "register" ? "Account registered" : "Logged in");
     } catch (error) {
@@ -742,13 +1342,23 @@ export function App() {
     setPasskeyTransferor(createEmptyPasskeyState());
     setPasskeyAdmin(createEmptyPasskeyState());
     resetTransferForm();
+    setActiveTab("overview");
+    setAccountPanelOpen(false);
     setAuthError("");
     setStatus("Logged out");
   }
 
+  function handleSwitchAccountClick() {
+    if (!switchConfirmArmed) {
+      setSwitchConfirmArmed(true);
+      return;
+    }
+
+    void handleLogout();
+  }
+
   async function restoreOriginalBalances() {
     try {
-      setStatus("Restoring original account balances...");
       const response = await fetch(`${MCP_BANK_URL}/admin/reset-balances`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -763,10 +1373,21 @@ export function App() {
       }
 
       await refreshAll();
-      setStatus("Account balances restored to their original values");
+      setRestoreConfirmArmed(false);
+      setRestoreNotice("Balances restored to original values");
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Failed to restore balances");
+      setRestoreNotice(error instanceof Error ? error.message : "Failed to restore balances");
     }
+  }
+
+  function handleRestoreBalancesClick() {
+    if (!restoreConfirmArmed) {
+      setRestoreConfirmArmed(true);
+      setRestoreNotice("Click ✓ to confirm resetting current account balances");
+      return;
+    }
+
+    void restoreOriginalBalances();
   }
 
   function getMissingPasskeyMessage() {
@@ -794,6 +1415,7 @@ export function App() {
     const missingPasskeyMessage = getMissingPasskeyMessage();
     if (missingPasskeyMessage) {
       setStatus(missingPasskeyMessage);
+      setAccountPanelOpen(true);
       return false;
     }
 
@@ -881,7 +1503,7 @@ export function App() {
       id: `evt_instr_${flowId}_hash`,
       kind: 101,
       ai_id: transferorPrincipalId,
-      created_at: Math.floor(Date.now() / 1000),
+      created_at: Date.now(),
       tags: [
         ["flow_id", flowId],
         ["role", "transferor"],
@@ -957,7 +1579,7 @@ export function App() {
       id: `evt_env_${Date.now()}_hash`,
       kind: 102,
       ai_id: DEMO_AGENT_IDS.transfer,
-      created_at: Math.floor(Date.now() / 1000),
+      created_at: Date.now(),
       tags: [
         ["flow_id", flowId],
         ["action", "payment.transfer"],
@@ -991,6 +1613,9 @@ export function App() {
 
   async function handleEvaluate() {
     try {
+      const nextFlowId = createFlowId();
+      setFlowId(nextFlowId);
+
       if (!passkeyTransferor.registered) {
         throw new Error("Transferor must register a passkey first");
       }
@@ -1012,7 +1637,7 @@ export function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          flowId,
+          flowId: nextFlowId,
           amount: submissionAmount,
           currency,
           memo,
@@ -1058,6 +1683,13 @@ export function App() {
         };
         verifierEvent: EventRecord;
       };
+      const selectedRecipientAllowlisted = Boolean(recipientAllowlisted);
+      const submittedAmount = Number(submissionAmount);
+      const selectedPolicyDecision = selectedRecipientAllowlisted
+        ? Number.isFinite(submittedAmount) && submittedAmount >= threshold
+          ? "admin_approval_required"
+          : "auto_execute_allowed"
+        : "policy_reject_recipient_not_allowlisted";
       const normalizedToolCalls = body.agent.tool_calls.map((toolCall) => {
         const args = toolCall.args ?? {};
 
@@ -1067,6 +1699,10 @@ export function App() {
             tool_name: "resolve_recipient",
             input_ref: toolCall.input_ref ?? args.recipient_id ?? "",
             output_ref: toolCall.output_ref ?? args.account_ref ?? "",
+            args: {
+              ...args,
+              allowlisted: String(selectedRecipientAllowlisted),
+            },
             trace_sig: toolCall.trace_sig ?? "",
             trace_id: toolCall.trace_id ?? "",
             trace_hash: toolCall.trace_hash ?? "",
@@ -1101,7 +1737,12 @@ export function App() {
             ...toolCall,
             tool_name: "validate_transfer_policy",
             input_ref: toolCall.input_ref ?? `${amount}|${currency}`,
-            output_ref: toolCall.output_ref ?? "policy preview prepared",
+            output_ref: toolCall.output_ref ?? selectedPolicyDecision,
+            args: {
+              ...args,
+              recipient_allowlisted: String(selectedRecipientAllowlisted),
+              policy_decision: selectedPolicyDecision,
+            },
             trace_sig: toolCall.trace_sig ?? "",
             trace_id: toolCall.trace_id ?? "",
             trace_hash: toolCall.trace_hash ?? "",
@@ -1135,10 +1776,19 @@ export function App() {
         toolCalls: normalizedToolCalls,
       });
       setLastVerifierEventId(body.verifierEvent.eventId);
-      setStatus(
-        `${describeVerifierStatus(body.verifierEvent)} via ${body.agent.mode} agent orchestration`,
-      );
-      await refreshAll();
+      const verifierStatus = describeVerifierStatus(body.verifierEvent);
+      setStatus(`${verifierStatus} via ${body.agent.mode} agent orchestration`);
+      await refreshAll(nextFlowId);
+
+      if (body.verifierEvent.kind === 108) {
+        setTransferFailureVerifierEvent(body.verifierEvent);
+        setTransferFailureModalOpen(true);
+        setInstructionComposerOpen(false);
+        return false;
+      }
+
+      setTransferFailureModalOpen(false);
+      setTransferFailureVerifierEvent(null);
       return true;
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Evaluation failed");
@@ -1191,7 +1841,7 @@ export function App() {
 
   async function handleExecuteTransfer() {
     try {
-      if (!transferorAccount || !recipientAccount || !lastVerifierEventId) {
+      if (!transferorAccount || !selectedRecipientAccount || !lastVerifierEventId) {
         throw new Error("Missing execution prerequisites");
       }
       if (!canExecute) {
@@ -1199,7 +1849,7 @@ export function App() {
       }
 
       const fromBefore = transferorAccount.availableBalance;
-      const toBefore = recipientAccount.availableBalance;
+      const toBefore = selectedRecipientAccount.availableBalance;
       const transferAmount = Number(amount);
 
       setStatus("Executing transfer in MCP bank...");
@@ -1210,7 +1860,7 @@ export function App() {
           flowId,
           verifierEventId: lastVerifierEventId,
           fromAccountId: transferorAccount.accountId,
-          toAccountId: recipientAccount.accountId,
+          toAccountId: selectedRecipientAccount.accountId,
           amount: Number(amount),
           currency,
         }),
@@ -1238,7 +1888,7 @@ export function App() {
         currency,
         amount: Number.isFinite(transferAmount) ? transferAmount : Number(amount || 0),
         fromAccountId: transferorAccount.accountId,
-        toAccountId: recipientAccount.accountId,
+        toAccountId: selectedRecipientAccount.accountId,
         fromBefore,
         fromAfter: Number.isFinite(fromAfter) ? fromAfter : fromBefore,
         toBefore,
@@ -1248,13 +1898,57 @@ export function App() {
 
       setStatus(
         body.alreadyExecuted
-          ? "Transfer was already executed; execution evidence has been refreshed"
-          : "Transfer executed in MCP bank and recorded as a Kind 109 execution event",
+          ? "Transfer was already executed automatically; execution evidence has been refreshed"
+          : "Transfer passed verification, executed automatically in MCP bank, and was recorded as a Kind 109 execution event",
       );
+      setExecutionSuccessModalOpen(true);
       await refreshAll();
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Execution failed");
     }
+  }
+
+  async function openArchiveTransaction(transaction: Transaction) {
+    const requestId = ++archiveDetailRequestRef.current;
+    setArchiveDetailOpen(true);
+    setArchiveDetailTransaction(transaction);
+    setArchiveDetailLoading(true);
+    setArchiveDetailError("");
+    setArchiveDetailRecords([]);
+
+    try {
+      const records =
+        transaction.flowId === flowId && archiveRecords.length > 0
+          ? archiveRecords
+          : await fetchArchiveRecordsForFlow(transaction.flowId);
+
+      if (archiveDetailRequestRef.current !== requestId) {
+        return;
+      }
+
+      setArchiveDetailRecords(records);
+    } catch (error) {
+      if (archiveDetailRequestRef.current !== requestId) {
+        return;
+      }
+
+      setArchiveDetailError(error instanceof Error ? error.message : "Failed to load archive details");
+    } finally {
+      if (archiveDetailRequestRef.current !== requestId) {
+        return;
+      }
+
+      setArchiveDetailLoading(false);
+    }
+  }
+
+  function closeArchiveTransaction() {
+    archiveDetailRequestRef.current += 1;
+    setArchiveDetailOpen(false);
+    setArchiveDetailTransaction(null);
+    setArchiveDetailLoading(false);
+    setArchiveDetailError("");
+    setArchiveDetailRecords([]);
   }
 
   async function createInstructionForScenario(input: {
@@ -1274,7 +1968,7 @@ export function App() {
           id: `evt_instr_${input.flowId}_hash`,
           kind: 101,
           ai_id: transferorPrincipalId,
-          created_at: Math.floor(Date.now() / 1000),
+          created_at: Date.now(),
           tags: [
             ["flow_id", input.flowId],
             ["role", "transferor"],
@@ -1334,7 +2028,7 @@ export function App() {
           id: `evt_env_${input.flowId}_hash`,
           kind: 102,
           ai_id: DEMO_AGENT_IDS.transfer,
-          created_at: Math.floor(Date.now() / 1000),
+          created_at: Date.now(),
           tags: [
             ["flow_id", input.flowId],
             ["action", "payment.transfer"],
@@ -1441,306 +2135,842 @@ export function App() {
   }
 
   return (
-    <div className="page">
-      <header className="hero">
-        <div>
-          <h1>SAFR x ATP Transfer Demo</h1>
+    <div className={`productShellPage ${showPasskeyOnboarding ? "overlayActive" : ""}`}>
+      <header className="productShellTopbar">
+        <div className="productShellHero">
+          <div className="productShellEyebrow">SAFR x ATP Demo</div>
+          <h1>{currentTabLabel}</h1>
           <p>
-            Active account: <strong>{activeAccountLabel}</strong> · Transferor:{" "}
-            <code>{transferorPrincipalId}</code> · Admin: <code>{adminPrincipalId}</code>
+            {currentTabDescription}
           </p>
         </div>
-        <div className="heroActions">
-          <button className="danger" onClick={() => void restoreOriginalBalances()}>
-            Restore balances
-          </button>
-          <button className="secondary" onClick={() => void handleLogout()}>
-            Switch account
-          </button>
+        <div className="productShellActions">
+          <div className={`productShellStateChip ${passkeySetupIncomplete ? "needsSetup" : "ready"}`}>
+            <span>State</span>
+            <strong>{currentStateSummary}</strong>
+          </div>
+          <div className="accountMenu" ref={accountPanelRef}>
+            <button
+              className={`accountMenuTrigger ${accountPanelOpen ? "open" : ""} ${showPasskeyOnboarding ? "spotlight" : ""}`}
+              type="button"
+              aria-haspopup="dialog"
+              aria-expanded={accountPanelOpen}
+              onClick={() => setAccountPanelOpen((current) => !current)}
+            >
+              <span className="accountMenuAvatar">{activeAccountLabel.slice(0, 1).toUpperCase()}</span>
+              <span className="accountMenuTriggerCopy">
+                <strong>{activeAccountLabel}</strong>
+                <small>{passkeySetupIncomplete ? "Passkeys need setup" : "Balances & passkeys"}</small>
+              </span>
+            </button>
+
+            {accountPanelOpen ? (
+              <div className="accountMenuPanel" role="dialog" aria-label="Account panel">
+                <div className="accountMenuHeader">
+                  <div>
+                    <span>Account</span>
+                    <strong>{activeAccountLabel}</strong>
+                  </div>
+                  <div className={`accountMenuStatus ${passkeySetupIncomplete ? "warning" : "ready"}`}>
+                    {passkeySetupIncomplete ? "Setup needed" : "Ready"}
+                  </div>
+                </div>
+
+                <div className="accountMenuBalanceSection">
+                  <div className="accountMenuBalanceTop">
+                    <strong>Balances</strong>
+                    {restoreConfirmArmed ? (
+                      <div className="accountMenuRestoreConfirm">
+                        <button
+                          className="accountMenuMiniButton ghost"
+                          type="button"
+                          aria-label="Cancel restore balances"
+                          title="Cancel restore"
+                          onClick={() => {
+                            setRestoreConfirmArmed(false);
+                            setRestoreNotice("");
+                          }}
+                        >
+                          ✕
+                        </button>
+                        <button
+                          className="accountMenuMiniButton danger"
+                          type="button"
+                          aria-label="Confirm restore balances"
+                          title="Confirm restore"
+                          onClick={() => void restoreOriginalBalances()}
+                        >
+                          ✓
+                        </button>
+                      </div>
+                    ) : (
+                      <button className="accountMenuMiniButton ghost" type="button" onClick={handleRestoreBalancesClick}>
+                        Restore balances
+                      </button>
+                    )}
+                  </div>
+                  <div className="accountMenuBalanceGrid">
+                    <div className="accountMenuBalanceCard">
+                      <span>Transferor balance</span>
+                      <strong>
+                        {transferorAccount
+                          ? `${transferorAccount.currency} ${transferorAccount.availableBalance.toFixed(2)}`
+                          : "Loading"}
+                      </strong>
+                    </div>
+                    <div className="accountMenuBalanceCard">
+                      <span>Recipient balance</span>
+                      <strong>
+                        {selectedRecipientAccount
+                          ? `${selectedRecipientAccount.currency} ${selectedRecipientAccount.availableBalance.toFixed(2)}`
+                          : "Loading"}
+                      </strong>
+                    </div>
+                  </div>
+                  {restoreNotice ? <small className="accountMenuRestoreNotice">{restoreNotice}</small> : null}
+                </div>
+
+                <div className="accountMenuSection">
+                  <div className="accountMenuSectionTop">
+                    <strong>Passkeys</strong>
+                    <small>
+                      {missingPasskeyRoles.length > 0
+                        ? `Still needed: ${missingPasskeyRoles.join(" and ")}.`
+                        : "All required signer passkeys are ready."}
+                    </small>
+                  </div>
+                  <div className="accountMenuPasskeyStack">
+                    <PasskeyCard
+                      compact
+                      title="Transferor Passkey"
+                      principalId={transferorPrincipalId}
+                      state={passkeyTransferor}
+                      registerButtonRef={transferorRegisterButtonRef}
+                      spotlight={!passkeyTransferor.registered}
+                      onRegister={() => void registerPasskey(transferorPrincipalId, "transferor")}
+                    />
+                    <PasskeyCard
+                      compact
+                      title="Administrator Passkey"
+                      principalId={adminPrincipalId}
+                      state={passkeyAdmin}
+                      registerButtonRef={adminRegisterButtonRef}
+                      spotlight={!passkeyAdmin.registered}
+                      onRegister={() => void registerPasskey(adminPrincipalId, "administrator")}
+                    />
+                  </div>
+                </div>
+
+                <div className="accountMenuFooter">
+                  {switchConfirmArmed ? (
+                    <div className="accountMenuRestoreConfirm">
+                      <button
+                        className="accountMenuMiniButton ghost"
+                        type="button"
+                        aria-label="Cancel switch account"
+                        title="Cancel switch"
+                        onClick={() => setSwitchConfirmArmed(false)}
+                      >
+                        ✕
+                      </button>
+                      <button
+                        className="accountMenuMiniButton danger"
+                        type="button"
+                        aria-label="Confirm switch account"
+                        title="Confirm switch"
+                        onClick={() => void handleLogout()}
+                      >
+                        ✓
+                      </button>
+                    </div>
+                  ) : (
+                    <button className="secondary" type="button" onClick={handleSwitchAccountClick}>
+                      Switch account
+                    </button>
+                  )}
+                </div>
+              </div>
+            ) : null}
+          </div>
         </div>
       </header>
 
-      <section className="panel">
-        <h2>Architecture Walkthrough</h2>
-        <div className="walkthroughGrid">
-          <div className="walkthroughCard">
-            <strong>1. Signed Human Instruction</strong>
-            <small>
-              Transferor signs a Kind 101 instruction with passkey-backed identity proof.
-            </small>
-          </div>
-          <div className="walkthroughCard">
-            <strong>2. Agent Envelope</strong>
-            <small>
-              The agent converts the instruction into a Kind 102 envelope for governed tool use.
-            </small>
-          </div>
-          <div className="walkthroughCard">
-            <strong>3. Verifier Decision</strong>
-            <small>
-              Verifier checks policy bundle, amount threshold, allowlist, and signature validity.
-            </small>
-          </div>
-          <div className="walkthroughCard">
-            <strong>4. Escalation Or Reject</strong>
-            <small>
-              High-value flows escalate to admin review; invalid flows emit Kind 108 rejection.
-            </small>
-          </div>
-          <div className="walkthroughCard">
-            <strong>5. MCP Bank Execution</strong>
-            <small>
-              Only executable verifier decisions can reach the bank transfer interface.
-            </small>
-          </div>
-          <div className="walkthroughCard">
-            <strong>6. Independent Archive</strong>
-            <small>
-              Each flow stage is copied into append-only archive records for audit evidence.
-            </small>
-          </div>
-        </div>
-      </section>
-
-      <section className="roles">
-        <RoleCard
-          title="Transferor"
-          subtitle="Signs original instruction"
-          status={
-            passkeyTransferor.registered
-              ? "Passkey Ready"
-              : "Passkey Not Registered"
-          }
-          principal={transferorPrincipalId}
-          detail={transferorAccount ? `${transferorAccount.accountId} · $${transferorAccount.availableBalance}` : "Loading account"}
-        />
-        <RoleCard
-          title="Recipient"
-          subtitle="Read-only balance view"
-          status="Read Only"
-          principal={recipientPrincipalId}
-          detail={recipientAccount ? `${recipientAccount.accountId} · $${recipientAccount.availableBalance}` : "Loading account"}
-        />
-        <RoleCard
-          title="Administrator"
-          subtitle="Signs only for high-value transfers"
-          status={
-            passkeyAdmin.registered
-              ? "Passkey Ready"
-              : "Passkey Not Registered"
-          }
-          principal={adminPrincipalId}
-          detail={requiresAdmin ? "Needed for this transfer" : "Not needed below threshold"}
-        />
-      </section>
-
-      <section className="panel">
-        <h2>Passkey Setup</h2>
-        <div className="passkeyGrid">
-          <PasskeyCard
-            title="Transferor Passkey"
-            principalId={transferorPrincipalId}
-            state={passkeyTransferor}
-            onRegister={() => void registerPasskey(transferorPrincipalId, "transferor")}
-          />
-          <PasskeyCard
-            title="Administrator Passkey"
-            principalId={adminPrincipalId}
-            state={passkeyAdmin}
-            onRegister={() => void registerPasskey(adminPrincipalId, "administrator")}
-          />
-        </div>
-        <p className="hint">
-          Passkeys start empty on entry. Once registered, they move straight into a ready state and
-          can be used directly for transfer submission or administrator approval.
-        </p>
-      </section>
-
-      <section className="panel flowTheaterPanel">
-        <div className="sectionHeader">
-          <div>
-            <h2>Live Governance Flow</h2>
-            <p className="flowSubcopy">
-              Watch the transfer move from signed human instruction to agent envelope, verifier
-              checks, agent forwarding, and MCP execution. Click any step to inspect the ATP
-              artifact, validation checks, and raw evidence.
-            </p>
-          </div>
-        </div>
-
-        <div className={`flowPolicyBanner ${policyView ? "flowPolicyBannerReady" : "flowPolicyBannerWarn"}`}>
-          <div className="flowPolicyBannerCopy">
-            <span>Active Governance Bundle</span>
-            <strong>
-              {policyView ? `${policyView.bundle.bundleId} · ${policyView.bundle.bundleVersion}` : "Policy status"}
-            </strong>
-            <small>{policySummary}</small>
-          </div>
-          <div className="flowPolicyBannerMeta flowPolicyBannerMetaCompact">
-            {policyView ? (
-              <>
-                <div>
-                  <span>Currency</span>
-                  <strong>{policyView.policy.currency}</strong>
-                </div>
-                <div>
-                  <span>Threshold</span>
-                  <strong>{policyView.policy.currency} {policyView.policy.adminReviewAtOrAbove.toFixed(2)}</strong>
-                </div>
-                <div>
-                  <span>Admin signature</span>
-                  <strong>Required above threshold</strong>
-                </div>
-              </>
-            ) : (
-              <>
-                <div>
-                  <span>State</span>
-                  <strong>{policyNotice ? "Loading" : "Waiting"}</strong>
-                </div>
-                <div>
-                  <span>Policy</span>
-                  <strong>USD only</strong>
-                </div>
-              </>
-            )}
-          </div>
-        </div>
-
-        {status !== "Ready" ? (
-          <div className={`flowStatusBanner statusTone-${getAppStatusTone(status, instructionSubmitBusy)}`}>
-            <strong>
-              {getAppStatusTone(status, instructionSubmitBusy) === "error"
-                ? "Error"
-                : getAppStatusTone(status, instructionSubmitBusy) === "success"
-                  ? "Success"
-                  : getAppStatusTone(status, instructionSubmitBusy) === "processing"
-                    ? "Processing"
-                    : "Status"}
-            </strong>
-            <span>{status}</span>
-          </div>
-        ) : null}
-
-        {executionBalanceSnapshot ? (
-          <ExecutionBalanceBanner snapshot={executionBalanceSnapshot} />
-        ) : null}
-
-        <div className="flowStageLane">
-          <FlowRelayMap
-            stages={flowStages}
-            spotlightStageId={spotlightStageId}
-            actionPulseStageId={actionPulseStageId}
-            flowId={flowId}
-            amount={amount}
-            currency={currency}
-            memo={memo}
-            recipientAccountRef={recipientAccountRef}
-            currentActionLabel={currentActionLabel}
-            currentActionHint={currentActionHint}
-            status={status}
-            policyView={policyView}
-            onOpenStage={(stageId) => setSelectedStageId(stageId)}
-            onOpenInstructionComposer={openInstructionComposerGuarded}
-            onNewInstruction={startNewFlowDraft}
-            requiresAdmin={requiresAdmin}
-            showAdminAction={requiresAdmin}
-            canAdminApprove={Boolean(passkeyAdmin.registered && firstVerifierEvent?.kind === 104)}
-            canExecute={canExecute}
-            highlightSubmit={instructionSubmitBusy || isDraft || (!firstVerifierEvent && !envelopeEvent)}
-            highlightAdmin={isWaitingForAdmin}
-            highlightExecute={isReadyForExecution}
-            onSubmitToVerifier={() => {
-              const missingPasskeyMessage = getMissingPasskeyMessage();
-              if (missingPasskeyMessage) {
-                setStatus(missingPasskeyMessage);
-                return;
-              }
-              if (!amount || !currency || !recipientAccountRef) {
-                openInstructionComposerGuarded();
-                return;
-              }
-              pulseAndRun("instruction", () => void handleEvaluate());
-            }}
-            onAdminApprove={() => pulseAndRun("admin", () => void handleAdminApprove())}
-            onExecuteTransfer={() => pulseAndRun("execution", () => void handleExecuteTransfer())}
-          />
-        </div>
-
-        <div className="flowStageLane">
-          {flowStages.map((stage, index) => (
-            <FlowStageCard
-              key={stage.id}
-              stage={stage}
-              index={index}
-              isLast={index === flowStages.length - 1}
-              spotlight={spotlightStageId === stage.id}
-              onClick={() => setSelectedStageId(stage.id)}
-            />
-          ))}
-        </div>
-
-        <div className="flowControlGrid">
-          <div className="flowOverviewCard">
-            <div className="flowOverviewTop">
-              <div>
-                <span className="flowOverviewLabel">Current flow</span>
-                <strong>{flowId}</strong>
-              </div>
-              <div className={`flowStatusPill flowStatus${getStatusTone(activeVerifierEvent, executionEvent)}`}>
-                {executionEvent
-                  ? "Executed"
-                  : rejectEvent
-                    ? "Rejected"
-                    : reverifyEvent
-                      ? "Re-verified"
-                      : firstVerifierEvent?.kind === 104
-                        ? "Awaiting Admin"
-                        : firstVerifierEvent?.kind === 103
-                          ? "Verifier Approved"
-                          : envelopeEvent
-                            ? "In Verification"
-                            : instructionEvent
-                              ? "At Agent"
-                              : "Draft"}
-              </div>
+      <div className="productShellLayout">
+        <aside className="productSidebar">
+          <div className="productSidebarSection">
+            <div className="productSidebarRail" role="tablist" aria-label="Product sections">
+              {sidebarTabs.map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  className={`productSidebarTab ${activeTab === tab.id ? "active" : ""} ${tab.attention ? "attention" : ""}`}
+                  onClick={() => setActiveTab(tab.id)}
+                  title={tab.hint}
+                >
+                  <strong>{tab.label}</strong>
+                </button>
+              ))}
             </div>
-            <div className="flowOverviewHero">
-              <div className="flowOverviewHeroMetric">
-                <span className="flowOverviewLabel">Stage</span>
-                <strong>{currentActionLabel}</strong>
+          </div>
+
+        </aside>
+
+        <main className="productMain">
+          {activeTab === "overview" ? (
+            <>
+              <section className="panel overviewHeroPanel">
+                <div className="overviewHeroCopy">
+                  <div className="overviewHeroText">
+                    <span className="flowOverviewLabel">Overview</span>
+                    <h2>Move a transfer from instruction to settlement</h2>
+                    <p>
+                      A transfer starts as a passkey-signed instruction, gets packaged by the agent, is checked by the
+                      verifier, routes through admin re-signing only when needed, and then settles in MCP.
+                    </p>
+                  </div>
+                  <div className="overviewHeroAside" aria-label="Overview summary">
+                    <div className="overviewHeroAsideCard">
+                      <span>Current state</span>
+                      <strong>{currentStateSummary}</strong>
+                    </div>
+                    <div className="overviewHeroAsideCard">
+                      <span>Agent model</span>
+                      <strong>{agentModelName}</strong>
+                    </div>
+                  </div>
+                  <div className="overviewHeroFooter">
+                    <p>Start a new transfer or inspect the active policy lane before you move forward.</p>
+                    <div className="actions overviewHeroActions">
+                      <button type="button" onClick={handleTransferPrimaryAction}>
+                        Start transfer
+                      </button>
+                      <button type="button" className="secondary" onClick={() => setActiveTab("policy")}>
+                        Review policy
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+            </>
+          ) : null}
+
+          {activeTab === "agent" ? (
+            <section className="panel productTabStack">
+              <div className="agentOverviewHero">
+                <div className="agentOverviewHeroLead compact">
+                  <span className="flowOverviewLabel">Gemini Enterprise Agent Platform</span>
+                  <strong>{hasAgentRun ? "Agent run for this transfer" : "Agent standing by"}</strong>
+                  <p>
+                    {hasAgentRun
+                      ? "The signed transfer instruction has already been handled. Here is the model, the prompt, and the checks that were applied."
+                      : "No transfer instruction has been submitted yet, so the agent has not been triggered."}
+                  </p>
+                </div>
+                <div className="agentOverviewStats">
+                  <FlowMiniStat label="Model" value={agentModelName} />
+                  <FlowMiniStat label="Mode" value={agentTrace?.mode ?? "adk"} />
+                  <FlowMiniStat label="Status" value={hasAgentRun ? "Triggered" : "Idle"} />
+                </div>
               </div>
-              <div className="flowOverviewHeroMetric">
-                <span className="flowOverviewLabel">Path</span>
-                <strong>{requiresAdmin ? "Admin approval lane" : "Auto-execution lane"}</strong>
+
+              {!hasAgentRun ? (
+                <div className="agentEmptyState">
+                  <strong>No transfer instruction yet</strong>
+                  <p>The agent stays idle until you start a transfer and submit the signed instruction.</p>
+                </div>
+              ) : (
+                <div className="agentRunStory">
+                  <div className="agentRunStoryPrimary">
+                    <div className="agentRunStoryHeader">
+                      <div className="agentRunStoryHeaderCopy">
+                        <span className="flowOverviewLabel">Run summary</span>
+                        <strong>Prompt, checks, tools, signed envelope</strong>
+                      </div>
+                      <div className="agentBadge">{formatDurationMs(agentTrace?.durationMs ?? 0)}</div>
+                    </div>
+                  </div>
+
+                  <div className="agentRunStoryList">
+                    <div className="agentRunStoryItem">
+                      <span>Prompt</span>
+                      <p>{getReadableAgentPrompt(agentTrace)}</p>
+                    </div>
+                    <div className="agentRunStoryItem">
+                      <span>Checks</span>
+                      <div className="agentCheckList">
+                        {buildAgentCheckViews(agentTrace).map((check) => (
+                          <div key={check.label} className={`agentCheckItem tone-${check.tone}`}>
+                            <span className="agentCheckIcon">{check.tone === "pass" ? "✓" : check.tone === "warn" ? "!" : "×"}</span>
+                            <div>
+                              <strong>{check.label}</strong>
+                              <p>{check.detail}</p>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="agentRunStoryItem wide">
+                      <span>Tools used</span>
+                      <div className="agentToolPills">
+                        {getAgentToolPills(agentTrace).map((toolName) => (
+                          <span key={toolName} className="agentToolPill">
+                            {toolName}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="agentRunStoryItem wide">
+                      <span>Signed envelope</span>
+                      <div className={`agentEnvelopePreview tone-${signedEnvelopeView.tone}`}>
+                        <div className="agentEnvelopePreviewTop">
+                          <strong>{signedEnvelopeView.statusLabel}</strong>
+                          <span className={`agentEnvelopeBadge tone-${signedEnvelopeView.tone}`}>
+                            {signedEnvelopeView.tone === "pass"
+                              ? "✓"
+                              : signedEnvelopeView.tone === "warn"
+                                ? "!"
+                                : "×"}
+                          </span>
+                        </div>
+                        <p>{signedEnvelopeView.summary}</p>
+                        <div className="agentEnvelopeFactGrid">
+                          {signedEnvelopeView.fields.map((field) => (
+                            <div key={field.label} className="agentEnvelopeFact">
+                              <span>{field.label}</span>
+                              <strong>{field.value}</strong>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="agentRunStats">
+                    <FlowMiniStat label="Started" value={agentTrace?.startedAt ? formatAgentTimestamp(agentTrace.startedAt) : "n/a"} />
+                    <FlowMiniStat label="Completed" value={agentTrace?.completedAt ? formatAgentTimestamp(agentTrace.completedAt) : "n/a"} />
+                    <FlowMiniStat label="Checks" value={String(agentTrace?.mandatoryTools?.length ?? 0)} />
+                    <FlowMiniStat label="Tools" value={String(agentTrace?.toolCalls.length ?? 0)} />
+                  </div>
+                </div>
+              )}
+            </section>
+          ) : null}
+
+          {activeTab === "verifier" ? (
+            <section className="panel productTabStack">
+              <div className="verifierOverviewHero">
+                <div className="verifierOverviewHeroLead">
+                  <span className="flowOverviewLabel">Verifier</span>
+                  <strong>Decision center for every transfer</strong>
+                  <p>{verifierTabNextStep}</p>
+                  <div className="verifierOverviewBadges">
+                    <span>{verifierTabDecisionLabel}</span>
+                    <span>{requiresAdmin ? "Admin lane on" : "Auto lane on"}</span>
+                    <span>
+                      {policyView
+                        ? `${policyView.policy.currency} ${policyView.policy.adminReviewAtOrAbove.toFixed(2)} threshold`
+                        : "Policy loading"}
+                    </span>
+                  </div>
+                </div>
+                <div className="verifierOverviewStats">
+                  <FlowMiniStat label="Decision" value={verifierTabDecisionLabel} />
+                  <FlowMiniStat label="Policy lane" value={requiresAdmin ? "Admin review" : "Auto lane"} />
+                  <FlowMiniStat label="Checks" value={instructionEvent ? "Active" : "Not started"} />
+                  <FlowMiniStat label="Agent handoff" value={hasAgentRun ? "Ready" : "Up next"} />
+                </div>
               </div>
-            </div>
-            <div className="flowMiniStats">
-              <FlowMiniStat label="ATP Events" value={String(events.length)} />
-              <FlowMiniStat label="Archived Checkpoints" value={String(archiveRecords.length)} />
-              <FlowMiniStat
-                label="Agent Duration"
-                value={agentTrace ? formatDurationMs(agentTrace.durationMs) : "n/a"}
+
+              <div className="verifierFlowSummary">
+                <div className="verifierFlowSummaryCard">
+                  <span>What gets checked</span>
+                  <strong>Instruction, recipient, amount</strong>
+                  <p>
+                    The verifier checks the signed packet, verifies the recipient, and compares the amount
+                    against the active policy lane.
+                  </p>
+                  <div className="verifierCheckList">
+                    {verifierCheckViews.map((check) => (
+                      <div key={check.label} className={`verifierCheckRow tone-${check.tone}`}>
+                        <span className="verifierCheckIcon">{check.tone === "pass" ? "✓" : check.tone === "warn" ? "!" : "×"}</span>
+                        <div>
+                          <strong>{check.label}</strong>
+                          <p>{check.detail}</p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div className="verifierFlowSummaryCard">
+                  <span>Lane result</span>
+                  <strong>{requiresAdmin ? "Admin confirmation required" : "Auto lane continues"}</strong>
+                  <p>
+                    {requiresAdmin
+                      ? "Transfers at or above the threshold branch into admin confirmation, then re-check and execution."
+                      : "Transfers below the threshold stay on the auto lane and continue automatically."}
+                  </p>
+                  <div className={`verifierLaneBadge ${requiresAdmin ? "warn" : "success"}`}>
+                    {requiresAdmin ? "Admin branch" : "Auto lane"}
+                  </div>
+                </div>
+              </div>
+            </section>
+          ) : null}
+
+          {activeTab === "policy" ? (
+            <section className="panel productTabStack">
+              <GovernancePolicyBanner
+                policyView={policyView}
+                policyNotice={policyNotice}
+                policySummary={policySummary}
               />
-              <FlowMiniStat
-                label="Executed Txns"
-                value={String(transactions.filter((item) => item.flowId === flowId).length)}
-              />
-            </div>
-            {rejectEvent ? (
-              <div className="rejectBanner">
-                <strong>Rejected</strong>
-                <span>{describeVerifierStatus(rejectEvent)}</span>
+
+              <div className="policyScenarioHeader">
+                <div>
+                  <span className="flowOverviewLabel">Signing rules</span>
+                  <strong>How the policy changes the approval path</strong>
+                </div>
               </div>
-            ) : null}
-            <p className="flowOverviewHint">
-              Archived checkpoints count append-only governance snapshots, not duplicate rows.
-              High-value flows usually archive after first verifier review, after admin reverify,
-              and after MCP execution.
+
+              <div className="policyScenarioGrid">
+                <section className="policyScenarioCard">
+                  <div className="policyScenarioTop">
+                    <div>
+                      <span className="flowOverviewLabel">Rule A</span>
+                      <h3>
+                        Below {policyView?.policy.currency ?? "USD"}{" "}
+                        {policyView?.policy.adminReviewAtOrAbove.toFixed(2) ?? "1000.00"}
+                      </h3>
+                    </div>
+                    <div className="policyScenarioBadge success">Auto-execution</div>
+                  </div>
+                  <p>
+                    Transferor signs, agent builds, verifier approves, agent forwards, bank executes.
+                  </p>
+                  <div className="policyStepFlow">
+                    <PolicyStep step="1" tone="transferor" title="Transferor" detail="Signs instruction" />
+                    <PolicyStep step="2" tone="agent" title="Agent" detail="Builds envelope" />
+                    <PolicyStep step="3" tone="verifier" title="Verifier" detail="Checks then approves" />
+                    <PolicyStep step="4" tone="agent" title="Agent" detail="Forwards approved package" />
+                    <PolicyStep step="5" tone="mcp" title="MCP Bank" detail="Executes transfer" terminal />
+                  </div>
+                  <div className="policyRuleChips">
+                    <span>Signature: Transferor only</span>
+                    <span>Admin: Not needed</span>
+                    <span>Lane: Auto-execution</span>
+                  </div>
+                </section>
+
+                <section className="policyScenarioCard warning">
+                  <div className="policyScenarioTop">
+                    <div>
+                      <span className="flowOverviewLabel">Rule B</span>
+                      <h3>
+                        At or above {policyView?.policy.currency ?? "USD"}{" "}
+                        {policyView?.policy.adminReviewAtOrAbove.toFixed(2) ?? "1000.00"}
+                      </h3>
+                    </div>
+                    <div className="policyScenarioBadge warning">Dual approval</div>
+                  </div>
+                  <p>
+                    Transferor signs, verifier escalates, admin re-signs, verifier re-checks, then bank executes.
+                  </p>
+                  <div className="policyStepFlow">
+                    <PolicyStep step="1" tone="transferor" title="Transferor" detail="Signs instruction" />
+                    <PolicyStep step="2" tone="agent" title="Agent" detail="Builds envelope" />
+                    <PolicyStep step="3" tone="verifier" title="Verifier" detail="Checks and escalates" />
+                    <PolicyStep step="4" tone="admin" title="Administrator" detail="Adds second signature" />
+                    <PolicyStep step="5" tone="verifier" title="Verifier" detail="Re-verifies approval" />
+                    <PolicyStep step="6" tone="agent" title="Agent" detail="Forwards approved package" />
+                    <PolicyStep step="7" tone="mcp" title="MCP Bank" detail="Executes transfer" terminal />
+                  </div>
+                  <div className="policyRuleChips">
+                    <span>Signatures: Transferor + Admin</span>
+                    <span>Admin: Required</span>
+                    <span>Lane: Dual approval</span>
+                  </div>
+                </section>
+              </div>
+            </section>
+          ) : null}
+
+          {activeTab === "trace" ? (
+            <section className="panel tracePagePanel">
+              <div className="traceHero">
+                <div className="traceHeroCopy">
+                  <span className="flowOverviewLabel">Trace</span>
+                  <h2>Transfer trace</h2>
+                  <p>Start with the outcome, then open a step only when you want more detail.</p>
+                </div>
+                <div className="traceHeroStats">
+                  <FlowMiniStat label="Model" value={agentModelName} />
+                  <FlowMiniStat label="History" value={String(archiveRecords.length)} />
+                </div>
+              </div>
+
+              <div className="traceSummaryRail">
+                {traceDigestCards.map((card) => (
+                  <div key={card.eyebrow} className={`traceSummaryItem status-${card.status}`}>
+                    <span>{card.eyebrow}</span>
+                    <strong>{card.title}</strong>
+                    <p>{card.summary}</p>
+                    <small>{card.meta}</small>
+                  </div>
+                ))}
+              </div>
+
+              <div className="traceJourneySection">
+                <div className="sectionHeader">
+                  <div>
+                    <h2>What happened</h2>
+                    <p className="flowSubcopy">Each row is a checkpoint. Click one to open the full evidence.</p>
+                  </div>
+                </div>
+
+                <div className="traceJourneyRail">
+                  {traceJourneyCards.map((card) => (
+                    <button
+                      key={card.title}
+                      type="button"
+                      className={`traceJourneyRow status-${card.status} tone-${card.tone}`}
+                      onClick={() => setSelectedStageId(card.stageId)}
+                    >
+                      <div className="traceJourneyRowMeta">
+                        <span className="traceJourneyStep">Step {card.step}</span>
+                        <span className={`traceJourneyPill ${card.status}`}>{card.statusLabel}</span>
+                      </div>
+                      <div className="traceJourneyRowBody">
+                        <div className="traceJourneyActor">{card.tone.toUpperCase()}</div>
+                        <div className="traceJourneyText">
+                          <strong>{card.title}</strong>
+                          <p>{card.summary}</p>
+                        </div>
+                      </div>
+                      <small>{card.meta}</small>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+            </section>
+          ) : null}
+
+          {activeTab === "archive" ? (
+            <section className="panel archivePagePanel">
+              <div className="archiveHero archiveHeroLedger">
+                <div className="archiveHeroCopy">
+                  <span className="flowOverviewLabel">Archive</span>
+                  <h2>Successful transfer history</h2>
+                  <p>
+                    A clean history of the current account&apos;s executed transfers, sorted newest
+                    first. Open any item to review the archive event it wrote.
+                  </p>
+                </div>
+              </div>
+
+              {archiveTransactions.length > 0 ? (
+                <div className="archiveLedger">
+                  {archiveGroupedTransactions.map((group) => (
+                    <div key={group.monthKey} className="archiveMonthGroup">
+                      <div className="archiveMonthHeader">
+                        <strong>{group.monthLabel}</strong>
+                        <span>{group.items.length} records</span>
+                      </div>
+                      <div className="archiveLedgerTableHead" aria-hidden="true">
+                        <span>Date</span>
+                        <span>Counterparty</span>
+                        <span>Txn</span>
+                        <span className="archiveLedgerAmountHeader">Amount</span>
+                      </div>
+                      <div className="archiveMonthList">
+                        {group.items.map((transaction) => {
+                          const isOutgoing = currentAccountIds.includes(transaction.fromAccountId);
+                          const counterpartyAccount = isOutgoing
+                            ? transaction.toAccountId
+                            : transaction.fromAccountId;
+                          const signedAmount = `${isOutgoing ? "-" : "+"} ${transaction.currency} ${transaction.amount.toFixed(2)}`;
+
+                          return (
+                            <button
+                              key={transaction.transactionId}
+                              type="button"
+                              className="archiveLedgerRow"
+                              onClick={() => void openArchiveTransaction(transaction)}
+                            >
+                              <div className="archiveLedgerCell archiveLedgerDate">
+                                <span>{formatAgentTimestamp(transaction.createdAt)}</span>
+                              </div>
+                              <div className="archiveLedgerCell archiveLedgerCounterparty">
+                                <strong>{counterpartyAccount}</strong>
+                              </div>
+                              <div className="archiveLedgerCell archiveLedgerTxn">
+                                <strong>{transaction.transactionId}</strong>
+                              </div>
+                              <div className="archiveLedgerCell archiveLedgerAmount">
+                                <strong className={isOutgoing ? "archiveAmount outgoing" : "archiveAmount incoming"}>
+                                  {signedAmount}
+                                </strong>
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="archiveEmptyState">
+                  <strong>No matching successful transfers</strong>
+                  <p>
+                    Try a different filter, or wait for the next successful transfer to appear
+                    here with the archive event details.
+                  </p>
+                </div>
+              )}
+            </section>
+          ) : null}
+
+          {activeTab === "overview" ? (
+            <section className="panel flowTheaterPanel overviewFlowPanel">
+              <div className="sectionHeader overviewFlowHeader">
+                <div>
+                  <h2>How the transfer moves</h2>
+                  <p className="flowSubcopy">
+                    The live flow view shows the signed instruction, policy lane, agent handoff, and
+                    execution proof in one place.
+                  </p>
+                </div>
+                <button type="button" className="secondary" onClick={() => setActiveTab("trace")}>
+                  Open trace
+                </button>
+              </div>
+
+              <GovernancePolicyBanner
+                policyView={policyView}
+                policyNotice={policyNotice}
+                policySummary={policySummary}
+                clickable
+                onClick={() => setActiveTab("policy")}
+              />
+
+              <div className="flowStageLane flowStageLaneOverview">
+                <FlowRelayMap
+                  stages={flowStages}
+                  spotlightStageId={spotlightStageId}
+                  actionPulseStageId={actionPulseStageId}
+                  flowId={flowId}
+                  amount={amount}
+                  currency={currency}
+                  memo={memo}
+                  recipientAccountRef={recipientAccountRef}
+                  status={status}
+                  policyView={policyView}
+                  onOpenStage={(stageId) => {
+                    setOverviewPreviewStageId(stageId);
+                  }}
+                  requiresAdmin={requiresAdmin}
+                  showAdminAction={requiresAdmin}
+                  canAdminApprove={canAdminApprove}
+                  canExecute={canExecute}
+                  highlightSubmit={instructionSubmitBusy || isFlowEmpty || (!firstVerifierEvent && !envelopeEvent)}
+                  highlightAdmin={isWaitingForAdmin}
+                  highlightExecute={isReadyForExecution}
+                  showAdminCue={false}
+                  onSubmitToVerifier={() => {
+                    const missingPasskeyMessage = getMissingPasskeyMessage();
+                    if (missingPasskeyMessage) {
+                      setStatus(missingPasskeyMessage);
+                      setAccountPanelOpen(true);
+                      return;
+                    }
+                    if (!amount || !currency || !recipientAccountRef) {
+                      if (openInstructionComposerGuarded()) {
+                        setActiveTab("transfer");
+                      } else {
+                        setAccountPanelOpen(true);
+                      }
+                      return;
+                    }
+                    pulseAndRun("instruction", () => void handleEvaluate());
+                  }}
+                  onAdminApprove={() => {
+                    setActiveTab("policy");
+                    pulseAndRun("admin", () => void handleAdminApprove());
+                  }}
+                />
+              </div>
+            </section>
+          ) : null}
+
+          {activeTab === "transfer" ? (
+            <>
+              <section className="panel productTabStack" ref={workflowPanelRef}>
+                <div className="productTransferHero">
+                  <div className="productTransferHeroLead">
+                    <div className="productTransferHeroLeadMain">
+                      <span className="flowOverviewLabel">Transfer</span>
+                      <strong>Create a transfer instruction</strong>
+                      <p>
+                        Create a signed transfer instruction and submit it to the agent for processing.
+                        Smaller amounts stay on the auto lane, while transfers at or above the policy
+                        threshold branch into admin review.
+                      </p>
+                      <div className="actions productTransferHeroActions">
+                        <button type="button" onClick={handleTransferPrimaryAction}>
+                          Start transfer
+                        </button>
+                        <button type="button" className="secondary" onClick={() => setActiveTab("policy")}>
+                          Review policy
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="productTransferHeroAside" aria-label="Transfer summary">
+                      <div className="productTransferHeroAsideCard">
+                        <span>Current state</span>
+                        <strong>{currentStateSummary}</strong>
+                        <small>{instructionEvent ? "Instruction already captured" : "No instruction submitted yet"}</small>
+                      </div>
+                      <div className="productTransferHeroAsideCard">
+                        <span>Policy lane</span>
+                        <strong>{requiresAdmin ? "Admin review" : "Auto lane"}</strong>
+                        <small>
+                          {policyView
+                            ? `${policyView.policy.currency} ${policyView.policy.adminReviewAtOrAbove.toFixed(2)} threshold`
+                            : "Policy loading"}
+                        </small>
+                      </div>
+                      <div className="productTransferHeroAsideCard wide">
+                        <span>Next step</span>
+                        <strong>{instructionEvent ? "Continue into the agent" : "Create the instruction first"}</strong>
+                        <small>
+                          {instructionEvent
+                            ? "The signed instruction will move into the governed agent envelope."
+                            : "Use the primary action to open the instruction composer."}
+                        </small>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <section className="panel flowTheaterPanel productWorkflowPanel">
+                <div className="sectionHeader">
+                  <div>
+                    <h2>Live Governance Flow</h2>
+                    <p className="flowSubcopy">
+                      Watch the transfer move from signed human instruction to agent envelope, verifier
+                      checks, agent forwarding, and MCP execution. Click any step to inspect the ATP
+                      artifact, validation checks, and raw evidence.
+                    </p>
+                  </div>
+                </div>
+
+                <GovernancePolicyBanner
+                  policyView={policyView}
+                  policyNotice={policyNotice}
+                  policySummary={policySummary}
+                  clickable={false}
+                />
+
+                <div className="flowStageLane">
+                <FlowRelayMap
+                  stages={flowStages}
+                  spotlightStageId={spotlightStageId}
+                  actionPulseStageId={actionPulseStageId}
+                    flowId={flowId}
+                    amount={amount}
+                    currency={currency}
+                    memo={memo}
+                    recipientAccountRef={recipientAccountRef}
+                    status={status}
+                    policyView={policyView}
+                    onOpenStage={(stageId) => {
+                      setSelectedStageId(stageId);
+                      setActiveTab("trace");
+                    }}
+                    requiresAdmin={requiresAdmin}
+                    showAdminAction={requiresAdmin}
+                    canAdminApprove={canAdminApprove}
+                  canExecute={canExecute}
+                  highlightSubmit={instructionSubmitBusy || isFlowEmpty || (!firstVerifierEvent && !envelopeEvent)}
+                  highlightAdmin={isWaitingForAdmin}
+                  highlightExecute={isReadyForExecution}
+                  showAdminCue={isWaitingForAdmin}
+                  adminCueRef={workflowAdminCueRef}
+                  onSubmitToVerifier={() => {
+                    const missingPasskeyMessage = getMissingPasskeyMessage();
+                    if (missingPasskeyMessage) {
+                        setStatus(missingPasskeyMessage);
+                        setAccountPanelOpen(true);
+                        return;
+                      }
+                      if (!amount || !currency || !recipientAccountRef) {
+                        if (openInstructionComposerGuarded()) {
+                          setActiveTab("transfer");
+                        } else {
+                          setAccountPanelOpen(true);
+                        }
+                        return;
+                      }
+                      pulseAndRun("instruction", () => void handleEvaluate());
+                    }}
+                    onAdminApprove={() => {
+                      setActiveTab("policy");
+                      pulseAndRun("admin", () => void handleAdminApprove());
+                    }}
+                  />
+                </div>
+                <div ref={workflowBottomRef} aria-hidden="true" className="workflowBottomAnchor" />
+              </section>
+            </>
+          ) : null}
+        </main>
+      </div>
+
+      {showPasskeyOnboarding ? (
+        <div
+          className={`passkeyOnboardingOverlay ${accountPanelOpen ? "panelOpen" : ""}`}
+          role="presentation"
+        >
+          <div className="passkeyOnboardingCard" role="dialog" aria-modal="true" aria-label="Passkey setup required">
+            <span className="passkeyOnboardingEyebrow">Passkey setup required</span>
+            <h2>Register your passkeys before continuing</h2>
+            <p>
+              To protect transfer submission and administrator approval, this account must finish
+              passkey setup first. Use the account menu in the top right to register the missing
+              signer passkeys.
             </p>
+            <div className="passkeyOnboardingChecklist">
+              {missingPasskeyRoles.map((item) => (
+                <div key={item} className="passkeyOnboardingChecklistItem">
+                  <span className="passkeyOnboardingChecklistDot" />
+                  <strong>{item}</strong>
+                </div>
+              ))}
+            </div>
+            <div className="passkeyOnboardingActions">
+              <button type="button" onClick={() => setAccountPanelOpen(true)}>
+                Open passkey setup
+              </button>
+              <small>
+                Complete both the transferor and administrator passkeys to unlock the rest of the
+                product.
+              </small>
+            </div>
+            <div className="passkeyOnboardingPointer" aria-hidden="true">
+              Continue from the highlighted account menu in the top right.
+            </div>
           </div>
         </div>
-      </section>
+      ) : null}
+
+      {showPasskeySuccessToast ? (
+        <div className="passkeySuccessToast" role="status" aria-live="polite">
+          Passkey setup complete. You can continue with your transfer.
+        </div>
+      ) : null}
 
       {selectedStage ? (
         <FlowStageModal
@@ -1754,10 +2984,83 @@ export function App() {
           archiveRecord={latestArchiveRecord}
           agentTrace={agentTrace}
           policyView={policyView}
+          amount={amount}
+          currency={currency}
           status={status}
           transferorPrincipalId={transferorPrincipalId}
           adminPrincipalId={adminPrincipalId}
           recipientPrincipalId={recipientPrincipalId}
+        />
+      ) : null}
+
+      {executionSuccessModalOpen && executionBalanceSnapshot ? (
+        <ExecutionSuccessModal
+          snapshot={executionBalanceSnapshot}
+          onClose={() => setExecutionSuccessModalOpen(false)}
+          onOpenWorkflow={() => {
+            setWorkflowScrollPending(true);
+            setActiveTab("transfer");
+          }}
+          onOpenTrace={() => setActiveTab("trace")}
+        />
+      ) : null}
+
+      {adminReviewPromptOpen ? (
+        <AdminReviewPromptModal
+          onClose={() => setAdminReviewPromptOpen(false)}
+          onOpenWorkflow={() => {
+            setAdminReviewPromptOpen(false);
+            setWorkflowScrollPending(true);
+            setActiveTab("transfer");
+          }}
+        />
+      ) : null}
+
+      {transferFailureModalOpen && transferFailureVerifierEvent ? (
+        <TransferFailureModal
+          verifierEvent={transferFailureVerifierEvent}
+          recipientAccountRef={recipientAccountRef}
+          onClose={() => setTransferFailureModalOpen(false)}
+          onEditTransfer={() => {
+            setTransferFailureModalOpen(false);
+            setInstructionComposerOpen(true);
+          }}
+          onOpenTrace={() => {
+            setTransferFailureModalOpen(false);
+            setActiveTab("trace");
+          }}
+        />
+      ) : null}
+
+      {archiveDetailOpen && archiveDetailTransaction ? (
+        <ArchiveTransactionModal
+          transaction={archiveDetailTransaction}
+          records={archiveDetailRecords}
+          loading={archiveDetailLoading}
+          error={archiveDetailError}
+          currentAccountIds={currentAccountIds}
+          onClose={closeArchiveTransaction}
+          onOpenTrace={() => {
+            const nextFlowId = archiveDetailTransaction.flowId;
+            closeArchiveTransaction();
+            setFlowId(nextFlowId);
+            setActiveTab("trace");
+          }}
+        />
+      ) : null}
+
+      {overviewPreviewStage ? (
+        <FlowStagePreviewModal
+          stage={overviewPreviewStage}
+          onClose={() => setOverviewPreviewStageId(null)}
+          policyView={policyView}
+          agentTrace={agentTrace}
+          agentModelName={agentModelName}
+          amount={amount}
+          currency={currency}
+          recipientAccountRef={recipientAccountRef}
+          flowStatusLabel={flowStatusLabel}
+          requiresAdmin={requiresAdmin}
         />
       ) : null}
 
@@ -1768,16 +3071,16 @@ export function App() {
           currency={currency}
           memo={memo}
           recipientAccountRef={recipientAccountRef}
-          allowlistedRecipientAccountRef={recipientAccount?.accountId ?? ""}
+          allowlistedRecipientAccountRef={allowlistedRecipientAccount?.accountId ?? ""}
           status={status}
           amountError={amountError || amountValidationMessage}
+          recipientHint={recipientHint}
           availableBalance={transferorAvailableBalance}
           policyView={policyView}
           onClose={() => {
             setInstructionComposerOpen(false);
             setAmountError("");
           }}
-          onNewInstruction={startNewFlowDraft}
           onAmountChange={(value) => {
             const nextAmount = sanitizeAmountInput(value);
             setAmount(nextAmount);
@@ -1796,7 +3099,8 @@ export function App() {
           onCurrencyChange={setCurrency}
           onMemoChange={setMemo}
           onRecipientChange={setRecipientAccountRef}
-          submitDisabled={instructionSubmitBusy}
+          submitDisabled={instructionSubmitBusy || Boolean(amountValidationMessage) || !recipientAccountRef}
+          isSubmitting={instructionSubmitBusy}
           onSubmit={async () => {
             if (instructionSubmitBusy) {
               return;
@@ -1805,12 +3109,21 @@ export function App() {
               setAmountError(amountValidationMessage);
               return;
             }
+            if (!recipientAccountRef) {
+              return;
+            }
+            if (!recipientAllowlisted) {
+              setStatus("This transfer will be rejected at verifier validation.");
+            }
             setInstructionSubmitBusy(true);
             setActionPulseStageId("instruction");
             try {
               const ok = await handleEvaluate();
               if (ok) {
                 setInstructionComposerOpen(false);
+                if (requiresAdmin && recipientAllowlisted) {
+                  setAdminReviewPromptOpen(true);
+                }
               }
             } finally {
               setInstructionSubmitBusy(false);
@@ -1822,37 +3135,51 @@ export function App() {
   );
 }
 
-function RoleCard(props: {
-  title: string;
-  subtitle: string;
-  status: string;
-  detail: string;
-  principal?: string;
-}) {
-  const badgeClassName = props.status === "Passkey Ready" ? "badge badgeVerified" : "badge";
-
-  return (
-    <div className="roleCard">
-      <h3>{props.title}</h3>
-      <p>{props.subtitle}</p>
-      <div className={badgeClassName}>{props.status}</div>
-      {props.principal ? (
-        <div className="principalLine">
-          <span>Principal</span>
-          <code>{props.principal}</code>
-        </div>
-      ) : null}
-      <small>{props.detail}</small>
-    </div>
-  );
-}
-
 function PasskeyCard(props: {
   title: string;
   principalId: string;
   state: PasskeyState;
   onRegister: () => void;
+  compact?: boolean;
+  spotlight?: boolean;
+  registerButtonRef?: RefObject<HTMLButtonElement | null>;
 }) {
+  if (props.compact) {
+    return (
+      <div className={`passkeyCard passkeyCardCompact ${props.spotlight ? "spotlight" : ""}`}>
+        <div className="passkeyCardCompactTop">
+          <div>
+            <strong>{props.title}</strong>
+            <small className="passkeyCardCompactHint">
+              {props.state.registered ? "Ready to sign protected actions" : "Registration required"}
+            </small>
+          </div>
+          <div className={props.state.registered ? "badge badgeVerified passkeyReadyBadge" : "badge"}>
+            {props.state.registered ? "Ready" : "Not Registered"}
+          </div>
+        </div>
+
+        <div className="principalLine">
+          <span>Principal</span>
+          <code>{props.principalId}</code>
+        </div>
+
+        {props.state.registered ? (
+          <div className="passkeyCardCompactMeta">
+            <small>{props.state.deviceType || "Passkey device registered"}</small>
+            <small>{props.state.lastUsedAt ? `Last used: ${props.state.lastUsedAt}` : "Ready immediately after registration"}</small>
+          </div>
+        ) : (
+          <div className="actions">
+            <button ref={props.registerButtonRef} onClick={props.onRegister}>
+              Register Passkey
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div className="passkeyCard">
       <strong>{props.title}</strong>
@@ -1896,10 +3223,31 @@ function PasskeyCard(props: {
         <>
           <small>No passkey registered yet.</small>
           <div className="actions">
-            <button onClick={props.onRegister}>Register Passkey</button>
+            <button ref={props.registerButtonRef} onClick={props.onRegister}>Register Passkey</button>
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+function PolicyStep(props: {
+  step: string;
+  tone: "transferor" | "agent" | "verifier" | "admin" | "mcp";
+  title: string;
+  detail: string;
+  terminal?: boolean;
+}) {
+  return (
+    <div className={`policyStepRow ${props.terminal ? "terminal" : ""}`}>
+      <div className="policyStepIndex">{props.step}</div>
+      <div className={`policySignerNode ${props.tone} ${props.terminal ? "terminal" : ""}`}>
+        <span className="policySignerIcon">{props.tone === "transferor" ? "T" : props.tone === "agent" ? "A" : props.tone === "verifier" ? "V" : props.tone === "admin" ? "A" : "M"}</span>
+        <div className="policySignerCopy">
+          <strong>{props.title}</strong>
+          <small>{props.detail}</small>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1919,6 +3267,118 @@ function FlowMiniStat(props: { label: string; value: string }) {
       <span>{props.label}</span>
       <strong>{props.value}</strong>
     </div>
+  );
+}
+
+function TraceJourneyCard(props: {
+  step: string;
+  tone: "transferor" | "agent" | "verifier" | "admin" | "mcp";
+  title: string;
+  summary: string;
+  meta: string;
+  status: "done" | "current" | "pending" | "skipped";
+  statusLabel: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`traceJourneyCard status-${props.status} tone-${props.tone}`}
+      onClick={props.onClick}
+    >
+      <div className="traceJourneyTop">
+        <span className="traceJourneyStep">Step {props.step}</span>
+        <span className={`traceJourneyPill ${props.status}`}>{props.statusLabel}</span>
+      </div>
+      <div className="traceJourneyActor">{props.tone.toUpperCase()}</div>
+      <strong>{props.title}</strong>
+      <p>{props.summary}</p>
+      <small>{props.meta}</small>
+    </button>
+  );
+}
+
+function TraceDigestCard(props: {
+  eyebrow: string;
+  title: string;
+  summary: string;
+  meta: string;
+  status: "done" | "current" | "pending" | "skipped" | "branch";
+}) {
+  return (
+    <div className={`traceDigestCard status-${props.status}`}>
+      <span>{props.eyebrow}</span>
+      <strong>{props.title}</strong>
+      <p>{props.summary}</p>
+      <small>{props.meta}</small>
+    </div>
+  );
+}
+
+function GovernancePolicyBanner(props: {
+  policyView: VerifierPolicyView | null;
+  policyNotice: string;
+  policySummary: string;
+  clickable?: boolean;
+  onClick?: () => void;
+}) {
+  const BannerTag = (props.onClick ? "button" : "div") as "button" | "div";
+
+  return (
+    <BannerTag
+      type={props.onClick ? "button" : undefined}
+      className={`flowPolicyBanner ${props.policyView ? "flowPolicyBannerReady" : "flowPolicyBannerWarn"} ${
+        props.clickable ? "flowPolicyBannerClickable" : ""
+      }`}
+      onClick={props.onClick}
+    >
+      <div className="flowPolicyBannerCopy">
+        <span>Active Governance Bundle</span>
+        <strong>
+          {props.policyView ? `${props.policyView.bundle.bundleId} · ${props.policyView.bundle.bundleVersion}` : "Policy status"}
+        </strong>
+        {props.policyView ? (
+          <small>Policy name, threshold, and admin path are surfaced here in one place.</small>
+        ) : (
+          <small>{props.policySummary || (props.policyNotice ? "Loading policy details." : "Policy details will appear here.")}</small>
+        )}
+      </div>
+      <div className="flowPolicyBannerMeta flowPolicyBannerMetaCompact">
+        {props.policyView ? (
+          <>
+            <div className="flowPolicyBannerMetaPolicy">
+              <span>Policy name</span>
+              <strong>{props.policyView.policy.policyName}</strong>
+            </div>
+            <div>
+              <span>Currency</span>
+              <strong>{props.policyView.policy.currency}</strong>
+            </div>
+            <div>
+              <span>Threshold</span>
+              <strong>
+                {props.policyView.policy.currency} {props.policyView.policy.adminReviewAtOrAbove.toFixed(2)}
+              </strong>
+            </div>
+            <div>
+              <span>Admin signature</span>
+              <strong>Required above threshold</strong>
+            </div>
+          </>
+        ) : (
+          <>
+            <div>
+              <span>State</span>
+              <strong>{props.policyNotice ? "Loading" : "Standby"}</strong>
+            </div>
+            <div>
+              <span>Policy</span>
+              <strong>USD only</strong>
+            </div>
+          </>
+        )}
+      </div>
+    </BannerTag>
   );
 }
 
@@ -1990,13 +3450,9 @@ function FlowRelayMap(props: {
   currency: string;
   memo: string;
   recipientAccountRef: string;
-  currentActionLabel: string;
-  currentActionHint: string;
   status: string;
   policyView: VerifierPolicyView | null;
   onOpenStage: (stageId: FlowStageId) => void;
-  onOpenInstructionComposer: () => void;
-  onNewInstruction: () => void;
   requiresAdmin: boolean;
   showAdminAction: boolean;
   canAdminApprove: boolean;
@@ -2004,9 +3460,10 @@ function FlowRelayMap(props: {
   highlightSubmit: boolean;
   highlightAdmin: boolean;
   highlightExecute: boolean;
+  showAdminCue?: boolean;
+  adminCueRef?: RefObject<HTMLDivElement | null>;
   onSubmitToVerifier: () => void;
   onAdminApprove: () => void;
-  onExecuteTransfer: () => void;
 }) {
   const instruction = props.stages.find((stage) => stage.id === "instruction");
   const envelope = props.stages.find((stage) => stage.id === "agent_envelope");
@@ -2023,20 +3480,17 @@ function FlowRelayMap(props: {
     props.actionPulseStageId === "admin" || props.actionPulseStageId === "agent_forward";
   const pulseExecutionPath = props.actionPulseStageId === "execution";
   const verifierPacketLabel = verifier?.kindLabel ?? (props.requiresAdmin ? "Kind 104" : "Kind 103");
-  const hasDraftInstruction = Boolean(
-    props.amount || props.currency || props.recipientAccountRef || props.memo,
-  );
 
   return (
     <div className="relayMap">
       <div className="relayHeader">
-        <div>
+        <div className="relayHeaderText">
           <span className="flowOverviewLabel">Animated flow view</span>
           <strong>Human -&gt; Agent -&gt; Verifier -&gt; Agent -&gt; MCP</strong>
         </div>
         <div className="relayLegend">
-          <span className="relayLegendItem active">Current packet</span>
-          <span className="relayLegendItem branch">Conditional branch</span>
+          <span className="relayLegendItem active">Active packet</span>
+          <span className="relayLegendItem branch">Review branch</span>
         </div>
       </div>
 
@@ -2046,11 +3500,6 @@ function FlowRelayMap(props: {
           spotlight={props.spotlightStageId === instruction?.id}
           pulsing={props.actionPulseStageId === "instruction"}
           onClick={props.onOpenStage}
-          actionLabel={hasDraftInstruction ? "Edit Human Instruction" : "Create Human Instruction"}
-          actionTone="primary"
-          actionEnabled
-          actionHighlighted={props.highlightSubmit}
-          onAction={props.onOpenInstructionComposer}
         />
         <RelayLink
           status={instruction?.status ?? "pending"}
@@ -2096,11 +3545,6 @@ function FlowRelayMap(props: {
           spotlight={props.spotlightStageId === execution?.id}
           pulsing={props.actionPulseStageId === "execution"}
           onClick={props.onOpenStage}
-          actionLabel="Execute Transfer"
-          actionTone="secondary"
-          actionEnabled={props.canExecute}
-          actionHighlighted={props.highlightExecute}
-          onAction={props.onExecuteTransfer}
         />
       </div>
 
@@ -2124,8 +3568,22 @@ function FlowRelayMap(props: {
         <div className="relayBranchSpacer" />
       </div>
 
+      {props.showAdminCue ? (
+        <div className="relayAdminCueRow" ref={props.adminCueRef} aria-hidden="true">
+          <div className="relayBranchSpacer" />
+          <div />
+          <div className="relayAdminCue">
+            <span className="relayAdminCueArrow">↑</span>
+            <strong>Click Admin Sign + Reverify</strong>
+            <small>Re-sign the high-value transfer here.</small>
+          </div>
+          <div />
+          <div className="relayBranchSpacer" />
+        </div>
+      ) : null}
+
       <div className="relayArchiveRow">
-        <span className="relayArchiveLabel">Side evidence path</span>
+        <span className="relayArchiveLabel">Audit evidence path</span>
         <RelayNode
           stage={archive}
           spotlight={props.spotlightStageId === archive?.id}
@@ -2146,11 +3604,12 @@ function InstructionComposerModal(props: {
   allowlistedRecipientAccountRef: string;
   status: string;
   amountError: string;
+  recipientHint: string;
   availableBalance: number | null;
   submitDisabled: boolean;
+  isSubmitting: boolean;
   policyView: VerifierPolicyView | null;
   onClose: () => void;
-  onNewInstruction: () => void;
   onAmountChange: (value: string) => void;
   onAmountBlur: () => void;
   onCurrencyChange: (value: string) => void;
@@ -2161,25 +3620,19 @@ function InstructionComposerModal(props: {
   const threshold = props.policyView?.policy.adminReviewAtOrAbove ?? 1000;
   const amountValue = Number(normalizeAmountInput(props.amount) || props.amount);
   const requiresAdmin = Number.isFinite(amountValue) && amountValue >= threshold;
+  const closeDisabled = props.isSubmitting;
 
   return (
-    <div className="flowModalBackdrop" onClick={props.onClose}>
+    <div className="flowModalBackdrop" onClick={closeDisabled ? undefined : props.onClose}>
       <div className="flowModal instructionComposerModal" onClick={(event) => event.stopPropagation()}>
         <div className="flowModalHeader">
           <div>
-            <span className="flowModalEyebrow">Human instruction</span>
-            <h3>Create and Sign Human Instruction</h3>
-            <p>Enter the transfer details here, then confirm to submit them into the verifier flow.</p>
+            <span className="flowModalEyebrow">Transfer details</span>
+            <h3>Create transfer instruction</h3>
+            <p>Choose the amount, recipient, and memo, then sign and submit the instruction.</p>
           </div>
-          <button className="flowModalClose" type="button" onClick={props.onClose}>
+          <button className="flowModalClose" type="button" onClick={props.onClose} disabled={closeDisabled}>
             Close
-          </button>
-          <button
-            className="flowModalSecondaryAction"
-            type="button"
-            onClick={props.onNewInstruction}
-          >
-            New Instruction
           </button>
         </div>
 
@@ -2223,6 +3676,13 @@ function InstructionComposerModal(props: {
                 acct_external_vendor_009 (Expect Reject)
               </option>
             </select>
+            {props.recipientAccountRef && props.allowlistedRecipientAccountRef !== props.recipientAccountRef ? (
+              <small className="flowFieldWarning">{props.recipientHint}</small>
+            ) : (
+              <small className="flowFieldHint">
+                {props.recipientHint}
+              </small>
+            )}
           </label>
           <label className="flowCommandField">
             <span>Memo</span>
@@ -2232,28 +3692,43 @@ function InstructionComposerModal(props: {
 
         <div className="instructionComposerFooter">
           <div className="instructionComposerMeta">
-            <div className="flowBundleMeta">
-              <span>Flow</span>
-              <strong>{props.flowId}</strong>
-            </div>
-            <div className="flowBundleMeta">
-              <span>Status</span>
-              <strong className={`instructionComposerStatus statusTone-${getAppStatusTone(props.status, props.submitDisabled)}`}>
-                {props.status}
-              </strong>
-            </div>
-            {props.policyView ? (
-              <div className="flowBundleMeta">
-                <span>Policy</span>
+            <div className="instructionComposerSummaryGrid">
+              <div className="instructionComposerSummaryCard">
+                <span>Amount</span>
                 <strong>
-                  Auto below {props.policyView.policy.currency}{" "}
-                  {props.policyView.policy.autoExecuteBelow.toFixed(2)} · Admin at{" "}
-                  {props.policyView.policy.adminReviewAtOrAbove.toFixed(2)} or above
+                  {props.currency} {normalizeAmountInput(props.amount) || "0.00"}
                 </strong>
+                {props.availableBalance !== null ? (
+                  <small>
+                    Balance: {props.currency} {props.availableBalance.toFixed(2)}
+                  </small>
+                ) : null}
               </div>
-            ) : null}
+              <div className="instructionComposerSummaryCard">
+                <span>Recipient</span>
+                <strong className={props.recipientAccountRef && props.recipientAccountRef !== props.allowlistedRecipientAccountRef ? "warning" : ""}>
+                  {props.recipientAccountRef || "Choose recipient"}
+                </strong>
+                <small>
+                  {!props.recipientAccountRef
+                    ? "Choose a recipient"
+                    : props.recipientAccountRef !== props.allowlistedRecipientAccountRef
+                      ? "This transfer will be rejected at verifier validation."
+                      : "Allowlisted recipient selected"}
+                </small>
+              </div>
+              <div className="instructionComposerSummaryCard">
+                <span>Route</span>
+                <strong>{requiresAdmin ? "Admin review" : "Auto lane"}</strong>
+                <small>
+                  {requiresAdmin
+                    ? `Transferor signs first, then admin re-signs above ${props.policyView?.policy.currency ?? "USD"} ${threshold.toFixed(2)}`
+                    : "Transferor signs, then submits to the agent"}
+                </small>
+              </div>
+            </div>
           </div>
-          <div className="instructionComposerActionColumn">
+            <div className="instructionComposerActionColumn">
             {requiresAdmin ? (
               <div className="instructionThresholdNotice" role="status" aria-live="polite">
                 <span className="instructionThresholdNoticeLabel">Admin review required</span>
@@ -2266,14 +3741,323 @@ function InstructionComposerModal(props: {
             <div className="actions">
               <button
                 type="button"
-                disabled={props.submitDisabled || Boolean(props.amountError)}
+                className={props.isSubmitting ? "is-submitting" : ""}
+                disabled={props.submitDisabled}
                 onClick={() => void props.onSubmit()}
               >
-                {props.submitDisabled ? "Submitting..." : "Confirm and Submit To Verifier"}
+                {props.isSubmitting ? "Submitting..." : "Submit transfer instruction"}
               </button>
             </div>
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function ExecutionSuccessModal(props: {
+  snapshot: ExecutionBalanceSnapshot;
+  onClose: () => void;
+  onOpenWorkflow: () => void;
+  onOpenTrace: () => void;
+}) {
+  const { snapshot } = props;
+
+  return (
+    <div className="flowModalBackdrop executionSuccessBackdrop" onClick={props.onClose}>
+      <div className="executionSuccessModal" onClick={(event) => event.stopPropagation()}>
+        <div className="flowModalHeader">
+          <div>
+            <span className="flowModalEyebrow">Transfer complete</span>
+            <h3>Transfer executed successfully</h3>
+            <p>
+              The bank finished this transfer automatically and updated both balances.
+            </p>
+          </div>
+          <button className="flowModalClose" type="button" onClick={props.onClose}>
+            Close
+          </button>
+        </div>
+
+        <ExecutionBalanceBanner snapshot={snapshot} />
+
+        <div className="executionSuccessActions">
+          <button
+            type="button"
+            onClick={() => {
+              props.onClose();
+              props.onOpenWorkflow();
+            }}
+          >
+            Open workflow table
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => {
+              props.onClose();
+              props.onOpenTrace();
+            }}
+          >
+            Open trace table
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AdminReviewPromptModal(props: {
+  onClose: () => void;
+  onOpenWorkflow: () => void;
+}) {
+  return (
+    <div className="flowModalBackdrop executionSuccessBackdrop" onClick={props.onClose}>
+      <div className="executionSuccessModal adminReviewPromptModal" onClick={(event) => event.stopPropagation()}>
+        <div className="flowModalHeader">
+          <div>
+            <span className="flowModalEyebrow">Admin review required</span>
+            <h3>Click Admin Sign + Reverify</h3>
+            <p>
+              This transfer is above the policy threshold. Open the workflow and continue at the
+              admin re-sign step.
+            </p>
+          </div>
+          <button className="flowModalClose" type="button" onClick={props.onClose}>
+            Close
+          </button>
+        </div>
+
+        <div className="adminReviewPromptBody">
+          <div className="adminReviewPromptCard">
+            <span>Next action</span>
+            <strong>Click Admin Sign + Reverify</strong>
+            <small>The workflow will jump to the admin branch and highlight the re-sign button.</small>
+          </div>
+        </div>
+
+        <div className="executionSuccessActions">
+          <button
+            type="button"
+            onClick={() => {
+              props.onClose();
+              props.onOpenWorkflow();
+            }}
+          >
+            Go to workflow
+          </button>
+          <button type="button" className="secondary" onClick={props.onClose}>
+            Stay here
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TransferFailureModal(props: {
+  verifierEvent: EventRecord;
+  recipientAccountRef: string;
+  onClose: () => void;
+  onEditTransfer: () => void;
+  onOpenTrace: () => void;
+}) {
+  const rejection = props.verifierEvent.payload.content.rejection_reason as
+    | { code?: string; message?: string }
+    | undefined;
+  const verifierCheckSections = getVerifierChecksSections(props.verifierEvent);
+  const rejectRows = getRejectDetailRows(props.verifierEvent);
+
+  return (
+    <div className="flowModalBackdrop executionFailureBackdrop" onClick={props.onClose}>
+      <div className="executionFailureModal" onClick={(event) => event.stopPropagation()}>
+        <div className="flowModalHeader">
+          <div>
+            <span className="flowModalEyebrow">Transfer rejected</span>
+            <h3>Transfer could not be submitted</h3>
+            <p>
+              {rejection?.message ?? "The verifier rejected this transfer."} Update the recipient and try again.
+            </p>
+          </div>
+          <button className="flowModalClose" type="button" onClick={props.onClose}>
+            Close
+          </button>
+        </div>
+
+        <div className="executionFailureSummary">
+          <div className="executionFailureSummaryCard">
+            <span>Selected recipient</span>
+            <strong>{props.recipientAccountRef || "Choose recipient"}</strong>
+            <small>
+              {rejection?.code ?? "verifier_rejection"}
+            </small>
+          </div>
+          <div className="executionFailureSummaryCard warning">
+            <span>Next step</span>
+            <strong>Choose an allowlisted recipient</strong>
+            <small>
+              The transfer will be rejected again until the recipient matches the allowlist.
+            </small>
+          </div>
+        </div>
+
+        <div className="flowModalBody">
+          <section className="flowModalSection">
+            <h4>Verifier checks</h4>
+            <div className="flowGroupGrid">
+              {verifierCheckSections.map((group) => (
+                <div key={`${group.title}-${props.verifierEvent.eventId}`} className="flowGroupCard">
+                  <div className="flowGroupTitle">{group.title}</div>
+                  <div className="flowGroupItems">
+                    {group.rows.map((row) => (
+                      <span key={`${group.title}-${row.label}-${row.value}`} className={getEvidenceValueClassName(row.value)}>
+                        {row.label}: {row.value}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <section className="flowModalSection">
+            <h4>Rejection details</h4>
+            <div className="evidenceGrid">
+              {rejectRows.map((row) => (
+                <div key={`${row.label}-${row.value}`} className="evidenceRow">
+                  <span>{row.label}</span>
+                  <strong className={getEvidenceValueClassName(row.value)}>{row.value}</strong>
+                </div>
+              ))}
+            </div>
+          </section>
+        </div>
+
+        <div className="executionFailureActions">
+          <button type="button" onClick={props.onEditTransfer}>
+            Edit transfer details
+          </button>
+          <button type="button" className="secondary" onClick={props.onOpenTrace}>
+            Open trace
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ArchiveTransactionModal(props: {
+  transaction: Transaction;
+  records: ArchiveRecord[];
+  loading: boolean;
+  error: string;
+  currentAccountIds: string[];
+  onClose: () => void;
+  onOpenTrace: () => void;
+}) {
+  const isOutgoing = props.currentAccountIds.includes(props.transaction.fromAccountId);
+  const directionLabel = isOutgoing ? "Outgoing" : "Incoming";
+  const counterpartyAccount = isOutgoing ? props.transaction.toAccountId : props.transaction.fromAccountId;
+  const archiveRecord = props.records.at(-1) ?? null;
+  const archivedEntityCount = archiveRecord?.content.archived_entities.length ?? 0;
+
+  useEffect(() => {
+    function handleEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        props.onClose();
+      }
+    }
+
+    window.addEventListener("keydown", handleEscape);
+    return () => window.removeEventListener("keydown", handleEscape);
+  }, [props]);
+
+  return (
+    <div className="flowModalBackdrop archiveModalBackdrop" onClick={props.onClose}>
+      <div className="flowModal archiveModal" onClick={(event) => event.stopPropagation()}>
+        <div className="flowModalHeader">
+          <div>
+            <span className="flowModalEyebrow">Archive event</span>
+            <h3>Archived successful transfer</h3>
+            <p>
+              This view shows the append-only archive record for the selected successful transfer.
+              Use it as a clean overview before opening the structured evidence.
+            </p>
+          </div>
+          <button type="button" className="flowModalClose" onClick={props.onClose}>
+            Close
+          </button>
+        </div>
+
+        <div className="archiveModalSummaryGrid">
+          <div className="archiveModalSummaryCard">
+            <span>Direction</span>
+            <strong className={`archiveDirection ${isOutgoing ? "outgoing" : "incoming"}`}>{directionLabel}</strong>
+            <small>
+              {props.transaction.currency} {props.transaction.amount.toFixed(2)}
+            </small>
+          </div>
+          <div className="archiveModalSummaryCard">
+            <span>Flow ID</span>
+            <strong>{props.transaction.flowId}</strong>
+            <small>Transaction executed successfully</small>
+          </div>
+          <div className="archiveModalSummaryCard">
+            <span>Counterparty</span>
+            <strong>{counterpartyAccount}</strong>
+            <small>{isOutgoing ? "Sent from the transferor side" : "Received by the recipient side"}</small>
+          </div>
+          <div className="archiveModalSummaryCard">
+            <span>Archive records</span>
+            <strong>{props.records.length}</strong>
+            <small>{archivedEntityCount} archived entities in the latest record</small>
+          </div>
+        </div>
+
+        {props.loading ? (
+          <div className="archiveModalLoading">Loading archive event details…</div>
+        ) : props.error ? (
+          <div className="archiveModalError" role="alert">
+            <strong>Could not load archive details</strong>
+            <p>{props.error}</p>
+          </div>
+        ) : archiveRecord ? (
+          <>
+            <div className="archiveModalOverview">
+              <div className="archiveModalOverviewCard">
+                <span>Created</span>
+                <strong>{formatAgentTimestamp(props.transaction.createdAt)}</strong>
+              </div>
+              <div className="archiveModalOverviewCard">
+                <span>Archive record</span>
+                <strong>{archiveRecord.content.archive_record_id}</strong>
+              </div>
+              <div className="archiveModalOverviewCard">
+                <span>Append-only index</span>
+                <strong>{archiveRecord.content.append_only_index}</strong>
+              </div>
+              <div className="archiveModalOverviewCard">
+                <span>Write mode</span>
+                <strong>{archiveRecord.content.write_mode}</strong>
+              </div>
+            </div>
+
+            <ArchiveEvidenceCard record={archiveRecord} domId={`archive-${props.transaction.transactionId}`} />
+            <div className="archiveModalActions">
+              <button type="button" onClick={props.onOpenTrace}>
+                View related trace
+              </button>
+              <button type="button" className="secondary" onClick={props.onClose}>
+                Close
+              </button>
+            </div>
+          </>
+        ) : (
+          <div className="archiveModalEmpty">
+            <strong>No archive record was returned for this flow.</strong>
+            <p>The transaction executed successfully, but the archive lookup did not return any rows.</p>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -2316,9 +4100,6 @@ function RelayNode(props: {
       <small>{stage.kindLabel}</small>
       {props.actionLabel ? (
         <div className="relayNodeActionWrap">
-          <span className="relayActionLabel">
-            {stage.module === "Human" ? "Human action" : stage.module === "MCP" ? "MCP action" : "Admin action"}
-          </span>
           <button
             type="button"
             className={`relayActionChip ${props.actionTone === "secondary" ? "relayActionChipSecondary" : ""} ${props.actionHighlighted ? (props.actionTone === "secondary" ? "flowActionCurrentSecondary" : "flowActionCurrent") : ""}`}
@@ -2401,6 +4182,8 @@ function FlowStageModal(props: {
   archiveRecord?: ArchiveRecord;
   agentTrace: AgentTrace | null;
   policyView: VerifierPolicyView | null;
+  amount: string;
+  currency: string;
   status: string;
   transferorPrincipalId: string;
   adminPrincipalId: string;
@@ -2428,6 +4211,8 @@ function FlowStageModal(props: {
     archiveRecord: props.archiveRecord,
     agentTrace: props.agentTrace,
     policyView: props.policyView,
+    amount: props.amount,
+    currency: props.currency,
     status: props.status,
     transferorPrincipalId: props.transferorPrincipalId,
     adminPrincipalId: props.adminPrincipalId,
@@ -2465,34 +4250,64 @@ function FlowStageModal(props: {
           </div>
         </div>
 
-        <div className="flowModalViewToggle">
-          <button
-            type="button"
-            className={viewMode === "presentation" ? "secondary activeToggle" : "secondary"}
-            onClick={() => setViewMode("presentation")}
-          >
-            Presentation View
-          </button>
-          <button
-            type="button"
-            className={viewMode === "technical" ? "secondary activeToggle" : "secondary"}
-            onClick={() => setViewMode("technical")}
-          >
-            Technical View
-          </button>
+        <div className="flowModalViewBar">
+          <div className="flowModalViewCopy">
+            <span className="flowOverviewLabel">View mode</span>
+            <strong>{viewMode === "presentation" ? "Presentation View" : "Technical View"}</strong>
+            <p>
+              {viewMode === "presentation"
+                ? "A clear, user-facing summary of the transfer step."
+                : "Raw evidence, signatures, and structured fields for technical review."}
+            </p>
+          </div>
+          <div className="flowModalViewToggle" role="tablist" aria-label="View mode switch">
+            <button
+              type="button"
+              className={viewMode === "presentation" ? "secondary activeToggle" : "secondary"}
+              onClick={() => setViewMode("presentation")}
+              aria-pressed={viewMode === "presentation"}
+            >
+              Presentation View
+            </button>
+            <button
+              type="button"
+              className={viewMode === "technical" ? "secondary activeToggle" : "secondary"}
+              onClick={() => setViewMode("technical")}
+              aria-pressed={viewMode === "technical"}
+            >
+              Technical View
+            </button>
+          </div>
         </div>
 
-        <div className="flowModalSignatureSummary">
-          {props.stage.signatureSummary.map((item) => (
-            <span key={item}>{item}</span>
-          ))}
-        </div>
-
-        <div className="flowModalChecks">
-          {props.stage.checks.map((item) => (
-            <span key={item}>{item}</span>
-          ))}
-        </div>
+        {viewMode === "presentation" ? (
+          <div className="flowModalPresentationIntro">
+            <div className="flowPresentationNote">
+              <strong>{props.stage.summary}</strong>
+              <span>
+                {props.stage.module} · {props.stage.actor} · {props.stage.kindLabel}
+              </span>
+            </div>
+            <div className="flowModalPresentationSplit">
+              <div className="flowModalPresentationCard">
+                <span>What is checked</span>
+                <ul>
+                  {props.stage.checks.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+              <div className="flowModalPresentationCard">
+                <span>Evidence trail</span>
+                <ul>
+                  {props.stage.signatureSummary.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+          </div>
+        ) : null}
 
         <div className="flowModalBody">
           {detailSections.map((section) => (
@@ -2597,6 +4412,331 @@ function FlowStageModal(props: {
               ) : null}
             </section>
           ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function getFlowStagePreviewSummary(
+  stage: FlowStage,
+  input: {
+    policyView: VerifierPolicyView | null;
+    agentTrace: AgentTrace | null;
+    agentModelName: string;
+    amount: string;
+    currency: string;
+    recipientAccountRef: string;
+    flowStatusLabel: string;
+    requiresAdmin: boolean;
+  },
+) {
+  const baseAmount = input.amount || "0.00";
+  const baseCurrency = input.currency || "USD";
+  const recipient = input.recipientAccountRef || "Select recipient";
+
+  switch (stage.id) {
+    case "instruction":
+      return "This is where the transfer starts: the human instruction is signed with a passkey and handed to the agent.";
+    case "agent_envelope":
+      return `The Gemini Enterprise Agent Platform packages the transfer, resolves the recipient, and prepares the governed request using ${input.agentModelName}.`;
+    case "verifier":
+      return input.policyView
+        ? `The verifier checks the signed packet against ${input.policyView.policy.policyName}, the recipient rules, and the proof before approving or escalating.`
+        : "The verifier checks the signed packet, recipient rules, and proof before approving or escalating.";
+    case "admin":
+      return input.policyView
+        ? `This higher-value path asks an administrator for a second passkey signature before the verifier can continue.`
+        : "This higher-value path asks an administrator for a second passkey signature before the verifier can continue.";
+    case "agent_forward":
+      return "Once approved, the agent forwards the signed decision package to the bank.";
+    case "execution":
+      return `The bank executes the approved transfer of ${baseCurrency} ${baseAmount} to ${recipient} and writes settlement proof.`;
+    case "archive":
+      return "An independent archive appends the evidence so the transfer can be reviewed later.";
+    default:
+      return `Current flow status: ${input.flowStatusLabel}.`;
+  }
+}
+
+function getFlowStagePreviewProgressCopy(
+  stage: FlowStage,
+  input: {
+    requiresAdmin: boolean;
+    flowStatusLabel: string;
+  },
+) {
+  if (stage.status === "done") {
+    return {
+      eyebrow: "Already reached",
+      title: "This step has already run",
+      text: "The flow has passed this point, so you can review the captured proof, checks, and signature trail.",
+      badge: "Already done",
+      accent: "done" as const,
+    };
+  }
+
+  if (stage.status === "current") {
+    return {
+      eyebrow: "Live step",
+      title: "This step is active now",
+      text: "This is the point where the flow is moving right now. The cards below show what has been captured so far and what still needs to happen.",
+      badge: "Active",
+      accent: "current" as const,
+    };
+  }
+
+  if (stage.status === "skipped") {
+    return {
+      eyebrow: "Not needed",
+      title: "This step does not apply to the current transfer",
+      text: input.requiresAdmin
+        ? "Because the amount stays on the auto lane, the administrator branch is not used for this transfer."
+        : "This branch is reserved for higher-value transfers, so the current flow does not need it.",
+      badge: "Not used here",
+      accent: "skipped" as const,
+    };
+  }
+
+  if (stage.status === "blocked") {
+    return {
+      eyebrow: "Unavailable",
+      title: "This step depends on an earlier approval",
+      text: "The flow cannot enter this step yet, so the modal shows it as a future stage instead of an active one.",
+      badge: "Unavailable",
+      accent: "blocked" as const,
+    };
+  }
+
+  const waitingText: Record<FlowStageId, string> = {
+    instruction: "This is the starting point of the flow, so it becomes active first.",
+    agent_envelope: "It has not been reached yet because the signed instruction still needs to be created.",
+    verifier: "It will open after the agent prepares the governed envelope.",
+    admin: input.requiresAdmin
+      ? "It will only appear if the verifier escalates the transfer to the higher-value lane."
+      : "It will not be used for this transfer because the amount stays below the admin threshold.",
+    agent_forward: "It becomes available only after the verifier signs off on the packet.",
+    execution: "It appears after the approved packet is forwarded to the bank.",
+    archive: "It is the final step and will show up after the transfer proof is written.",
+  };
+
+  return {
+    eyebrow: "Not reached yet",
+    title: "This step is still ahead in the flow",
+    text: waitingText[stage.id] ?? `This step has not been reached yet. ${input.flowStatusLabel}.`,
+    badge: "Not reached yet",
+    accent: "pending" as const,
+  };
+}
+
+function FlowStagePreviewModal(props: {
+  stage: FlowStage;
+  onClose: () => void;
+  policyView: VerifierPolicyView | null;
+  agentTrace: AgentTrace | null;
+  agentModelName: string;
+  amount: string;
+  currency: string;
+  recipientAccountRef: string;
+  flowStatusLabel: string;
+  requiresAdmin: boolean;
+}) {
+  useEffect(() => {
+    function handleEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        props.onClose();
+      }
+    }
+
+    window.addEventListener("keydown", handleEscape);
+    return () => window.removeEventListener("keydown", handleEscape);
+  }, [props]);
+
+  const summary = getFlowStagePreviewSummary(props.stage, {
+    policyView: props.policyView,
+    agentTrace: props.agentTrace,
+    agentModelName: props.agentModelName,
+    amount: props.amount,
+    currency: props.currency,
+    recipientAccountRef: props.recipientAccountRef,
+    flowStatusLabel: props.flowStatusLabel,
+    requiresAdmin: props.requiresAdmin,
+  });
+
+  const progressCopy = getFlowStagePreviewProgressCopy(props.stage, {
+    requiresAdmin: props.requiresAdmin,
+    flowStatusLabel: props.flowStatusLabel,
+  });
+
+  const quickFacts = [
+    { label: "ATP type", value: props.stage.artifact },
+    { label: "Kind", value: props.stage.kindLabel },
+    { label: "Actor", value: props.stage.actor },
+    { label: "Status", value: progressCopy.badge },
+  ];
+
+  const checksToShow = props.stage.checks.slice(0, 4);
+  const signatureItems = props.stage.signatureSummary.slice(0, 3);
+  const amountLabel = props.amount ? `${props.currency} ${props.amount}` : "No amount set yet";
+  const hasAmount = Boolean(props.amount.trim());
+  const pathLabel = !hasAmount
+    ? "Amount not set"
+    : props.stage.path === "conditional"
+      ? "Conditional path"
+      : props.stage.path === "support"
+        ? "Support path"
+        : props.stage.path === "terminal"
+          ? "Terminal step"
+          : "Primary path";
+  const transferLaneLabel = !hasAmount
+    ? "Not selected yet"
+    : props.requiresAdmin
+      ? "Admin review lane"
+      : "Auto lane";
+  const platformLabel =
+    props.stage.module === "Agent"
+      ? "Gemini Enterprise Agent Platform"
+      : props.stage.module === "Verifier"
+        ? "Verifier policy check"
+        : props.stage.module === "Admin Branch"
+          ? "Admin passkey confirmation"
+          : props.stage.module;
+  const agentRunLabel =
+    props.stage.module === "Agent"
+      ? props.agentTrace
+        ? "Agent run captured"
+        : "No transfer instruction yet"
+      : props.agentTrace
+        ? "Agent evidence available"
+        : "Agent not triggered yet";
+  const isFutureStep = props.stage.status === "pending" || props.stage.status === "skipped";
+
+  return (
+    <div className="flowModalBackdrop" onClick={props.onClose}>
+      <div className="flowPreviewModal" onClick={(event) => event.stopPropagation()}>
+        <div className="flowPreviewHeader">
+          <div>
+            <span className="flowPreviewEyebrow">
+              {props.stage.module} · {props.stage.kindLabel}
+            </span>
+            <h3>{props.stage.title}</h3>
+            <p>{props.stage.summary}</p>
+          </div>
+          <button type="button" className="flowModalClose" onClick={props.onClose}>
+            Close
+          </button>
+        </div>
+
+        <div className={`flowPreviewStateBanner ${progressCopy.accent}`}>
+          <div>
+            <span className="flowPreviewLabel">{progressCopy.eyebrow}</span>
+            <strong>{progressCopy.title}</strong>
+            <p>{progressCopy.text}</p>
+          </div>
+            <span className="flowPreviewStateBadge">{progressCopy.badge}</span>
+          </div>
+
+        <div className="flowPreviewHero">
+          <div className="flowPreviewHeroMain">
+            <span className="flowPreviewLabel">What this means</span>
+            <p>{summary}</p>
+            <div className="flowPreviewPillRow">
+              <span className="flowPreviewPill tone-current">{props.flowStatusLabel}</span>
+              <span className="flowPreviewPill tone-actor">{props.stage.actor}</span>
+              <span className="flowPreviewPill tone-lane">{transferLaneLabel}</span>
+              <span className="flowPreviewPill tone-platform">{platformLabel}</span>
+              <span className="flowPreviewPill tone-trace">{agentRunLabel}</span>
+            </div>
+          </div>
+
+          <div className="flowPreviewHeroAside">
+            <div className="flowPreviewHeroStat">
+              <span>Current transfer</span>
+              <strong>{amountLabel}</strong>
+              <small>
+                {hasAmount
+                  ? `To ${props.recipientAccountRef || "choose a recipient"}`
+                  : "Choose an amount before the policy lane is decided"}
+              </small>
+            </div>
+            <div className="flowPreviewHeroStat">
+              <span>Policy lane</span>
+              <strong>{transferLaneLabel}</strong>
+              <small>
+                {hasAmount
+                  ? pathLabel
+                  : "The route is not decided yet because the transfer amount is still empty"}
+              </small>
+            </div>
+          </div>
+        </div>
+
+        <div className="flowPreviewFactGrid">
+          {quickFacts.map((item) => (
+            <div key={item.label} className="flowPreviewFactCard">
+              <span>{item.label}</span>
+              <strong>{item.value}</strong>
+            </div>
+          ))}
+        </div>
+
+        <div className="flowPreviewTransferCard">
+          <div className="flowPreviewSectionHeader">
+            <div>
+              <span className="flowPreviewLabel">Current transfer</span>
+              <strong>{amountLabel}</strong>
+            </div>
+            <span className="flowPreviewMiniBadge">{pathLabel}</span>
+          </div>
+          <p>
+            {props.requiresAdmin
+              ? "Higher-value transfer: transferor signature first, then an administrator confirmation before the verifier can continue."
+              : "Auto lane: transferor signature first, then the agent and verifier handle the rest unless the amount changes later."}
+          </p>
+          {isFutureStep ? (
+            <div className="flowPreviewFutureStep">
+              <span className="flowPreviewLabel">Not reached yet</span>
+              <strong>Keep going in the earlier step to unlock this stage</strong>
+              <p>
+                {props.stage.status === "skipped"
+                  ? "This branch does not apply to the current transfer, so it will stay inactive unless the amount moves into the higher-value lane."
+                  : "The flow has not advanced this far yet, so this stage is shown as a preview of what will appear next."}
+              </p>
+            </div>
+          ) : null}
+        </div>
+
+        <div className="flowPreviewSplit">
+          <div className="flowPreviewSectionBlock">
+            <div className="flowPreviewSectionHeader">
+              <div>
+                <span className="flowPreviewLabel">What gets checked</span>
+                <strong>Quick policy and proof review</strong>
+              </div>
+            </div>
+            <div className="flowPreviewCheckList">
+              {checksToShow.map((item) => (
+                <div key={item} className="flowPreviewCheckItem">
+                  <span className="flowPreviewCheckDot" />
+                  <span>{item}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="flowPreviewSectionBlock">
+            <div className="flowPreviewSectionHeader">
+              <div>
+                <span className="flowPreviewLabel">Signatures and proof</span>
+                <strong>What is attached to the step</strong>
+              </div>
+            </div>
+            <div className="flowPreviewSignatureSummary">
+              {signatureItems.map((item) => (
+                <span key={item}>{item}</span>
+              ))}
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -2756,6 +4896,18 @@ function formatAgentTimestamp(value?: string) {
   return parsed.toLocaleString();
 }
 
+function formatArchiveMonthLabel(monthKey: string) {
+  const parsed = new Date(`${monthKey}-01T00:00:00`);
+  if (Number.isNaN(parsed.getTime())) {
+    return monthKey;
+  }
+
+  return new Intl.DateTimeFormat("en-US", {
+    month: "long",
+    year: "numeric",
+  }).format(parsed);
+}
+
 function formatDurationMs(value?: number) {
   if (typeof value !== "number" || Number.isNaN(value)) {
     return "n/a";
@@ -2774,6 +4926,124 @@ function formatPromptText(value?: string) {
   }
 
   return value;
+}
+
+type AgentCheckView = {
+  label: string;
+  detail: string;
+  tone: "pass" | "warn" | "fail";
+};
+
+type SignedEnvelopeView = {
+  summary: string;
+  statusLabel: string;
+  tone: "pass" | "warn" | "fail";
+  fields: Array<{ label: string; value: string }>;
+};
+
+function getReadableAgentPrompt(trace?: AgentTrace | null) {
+  if (!trace) {
+    return "No prompt captured yet.";
+  }
+
+  if (trace.promptPreview) {
+    return trace.promptPreview;
+  }
+
+  if (trace.promptText) {
+    try {
+      const parsed = JSON.parse(trace.promptText) as Record<string, unknown>;
+      const amount = String(parsed.amount ?? "0.00");
+      const currency = String(parsed.currency ?? "USD");
+      const recipientAccountRef = String(parsed.recipient_account_ref ?? "the selected recipient");
+      return `Resolve the selected recipient, then check whether ${amount} ${currency} to ${recipientAccountRef} can auto-execute under the active policy.`;
+    } catch {
+      return trace.promptText;
+    }
+  }
+
+  return "No prompt captured yet.";
+}
+
+function buildAgentCheckViews(trace?: AgentTrace | null): AgentCheckView[] {
+  const resolveRecipientCall = trace?.toolCalls.find((toolCall) => toolCall.tool_name === "resolve_recipient");
+  const policyCall = trace?.toolCalls.find((toolCall) => toolCall.tool_name === "validate_transfer_policy");
+  const recipientMatched = String(resolveRecipientCall?.args?.allowlisted ?? "").toLowerCase() === "true";
+  const policyDecision = String(policyCall?.args?.policy_decision ?? policyCall?.output_ref ?? "");
+  const amount = String(policyCall?.args?.amount ?? "");
+  const currency = String(policyCall?.args?.currency ?? "USD");
+
+  const policyPass = policyDecision === "auto_execute_allowed";
+  const policyWarn = policyDecision === "policy_review_required" || policyDecision === "admin_approval_required";
+
+  return [
+    {
+      label: "Recipient is on the allowlist",
+      detail: recipientMatched
+        ? `Resolved to ${resolveRecipientCall?.output_ref || "the target account"} and passed the allowlist check.`
+        : "The selected recipient is not on the allowlist.",
+      tone: recipientMatched ? "pass" : "fail",
+    },
+    {
+      label: policyPass
+        ? "Amount stays below policy threshold"
+        : policyWarn
+          ? "Amount needs review"
+          : "Policy rejected the amount",
+      detail: policyPass
+        ? `${amount} ${currency} stays below the auto-execution threshold.`
+        : policyWarn
+          ? `${amount || "The amount"} ${currency} needs additional review under the active policy.`
+          : policyDecision
+            ? `Policy decision: ${policyDecision}.`
+            : "Policy validation did not return a decision.",
+      tone: policyPass ? "pass" : policyWarn ? "warn" : "fail",
+    },
+  ];
+}
+
+function getAgentToolPills(trace?: AgentTrace | null) {
+  const toolNames = trace?.toolCalls.length ? trace.toolCalls.map((toolCall) => getAgentToolTitle(toolCall.tool_name)) : [];
+  return toolNames.length ? toolNames : ["No tools captured yet"];
+}
+
+function getSignedEnvelopeView(envelopeEvent?: EventRecord | null): SignedEnvelopeView {
+  if (!envelopeEvent) {
+    return {
+      summary: "No signed envelope captured yet.",
+      statusLabel: "Not available",
+      tone: "warn",
+      fields: [],
+    };
+  }
+
+  const content = envelopeEvent.payload.content as Record<string, unknown>;
+  const action = content.action as Record<string, unknown> | undefined;
+  const params = action?.params as Record<string, unknown> | undefined;
+  const agentSignature = content.agent_signature as Record<string, unknown> | undefined;
+  const amount = String(params?.amount ?? content.amount ?? "unknown");
+  const currency = String(params?.currency ?? content.currency ?? "USD");
+  const recipientAccountRef = String(params?.recipient_account_ref ?? content.recipient_account_ref ?? "unknown");
+  const signed = Boolean(agentSignature?.agent_sig || agentSignature?.signed_payload);
+
+  return {
+    summary: `Kind 102 envelope signed for ${amount} ${currency} to ${recipientAccountRef}.`,
+    statusLabel: signed ? "Signed envelope" : "Envelope pending signature",
+    tone: signed ? "pass" : "fail",
+    fields: [
+      { label: "Instruction ref", value: String(content.instruction_ref ?? "unknown") },
+      { label: "Recipient account", value: recipientAccountRef },
+      { label: "Amount", value: `${amount} ${currency}` },
+      {
+        label: "Agent signature",
+        value: signed ? "Attached and traceable" : "Missing",
+      },
+      {
+        label: "Signed payload",
+        value: String(agentSignature?.signed_payload ?? agentSignature?.signed_payload_c14n ?? "unknown"),
+      },
+    ],
+  };
 }
 
 function TraceStepCard(props: {
@@ -3339,7 +5609,7 @@ function getAdminApprovalSection(event: EventRecord) {
   const content = event.payload.content;
   const proof = content.signature_proof as Record<string, unknown> | undefined;
   return {
-    title: "Administrator Approval",
+    title: "Administrator Authorization",
     rows: [
       { label: "Verifier Record Ref", value: String(content.verifier_record_ref ?? "unknown") },
       { label: "Admin ID", value: String(content.admin_id ?? "unknown") },
@@ -3371,7 +5641,7 @@ function formatTimestamp(value: number) {
   if (!Number.isFinite(value)) {
     return "unknown";
   }
-  return new Date(value * 1000).toISOString();
+  return new Date(value < 1e12 ? value * 1000 : value).toISOString();
 }
 
 function humanizeCheckLabel(value: string) {
@@ -3510,7 +5780,7 @@ function buildVerifierCheckGroups(event?: EventRecord) {
       {
         title: "Verifier Gate",
         items: [
-          "Waiting for envelope and signatures",
+          "Envelope and signatures have not been recorded yet",
           "No verifier check result written yet",
         ],
       },
@@ -3568,14 +5838,14 @@ function buildFlowStages(input: {
   return [
     {
       id: "instruction",
-      title: "Signed Human Instruction",
+      title: "Transfer Instruction",
       module: "Human",
       actor: "Human -> Agent",
-      artifact: "Kind 101 Signed Instruction",
+      artifact: "Kind 101 Transfer Instruction",
       kindLabel: "Kind 101",
       summary: "Transferor signs the original instruction with passkey-backed proof and submits it to the agent.",
       status: input.instructionEvent ? "done" : "current",
-      statusLabel: input.instructionEvent ? "Captured" : "Waiting For Signature",
+      statusLabel: input.instructionEvent ? "Captured" : "Ready for signature",
       checks: [
         "Passkey authentication completed",
         "Instruction payload hash bound",
@@ -3589,14 +5859,14 @@ function buildFlowStages(input: {
     },
     {
       id: "agent_envelope",
-      title: "Agent Builds Envelope",
+      title: "Governance Envelope",
       module: "Agent",
       actor: "Agent",
       artifact: "Kind 102 Governance Envelope",
       kindLabel: "Kind 102",
       summary: "Agent resolves recipient, applies the fixed transfer skill, and signs the governed envelope.",
       status: input.envelopeEvent ? "done" : input.instructionEvent ? "current" : "pending",
-      statusLabel: input.envelopeEvent ? "Envelope Signed" : input.instructionEvent ? "Agent Running" : "Pending",
+      statusLabel: input.envelopeEvent ? "Envelope Signed" : input.instructionEvent ? "Agent Running" : "Up next",
       checks: [
         "Resolve recipient tool called",
         "Transfer policy tool called",
@@ -3610,16 +5880,16 @@ function buildFlowStages(input: {
     },
     {
       id: "verifier",
-      title: "Verifier Evaluates Envelope",
+      title: "Verification Decision",
       module: "Verifier",
       actor: "Verifier",
       artifact:
         input.reverifyEvent?.kind === 107
-          ? "Kind 107 Re-Verification"
+          ? "Kind 107 Re-Verification Decision"
           : input.firstVerifierEvent?.kind === 104
             ? "Kind 104 Escalation Decision"
             : input.firstVerifierEvent?.kind === 108
-              ? "Kind 108 Rejection"
+              ? "Kind 108 Rejection Decision"
               : "Kind 103 Approval Decision",
       kindLabel:
         input.reverifyEvent?.kind === 107
@@ -3647,7 +5917,7 @@ function buildFlowStages(input: {
                 ? "Rejected"
                 : input.envelopeEvent
                   ? "Checking"
-                  : "Pending",
+                  : "Up next",
       checks: [
         "Transferor proof reference validated",
         "Agent envelope signature verified",
@@ -3662,10 +5932,10 @@ function buildFlowStages(input: {
     },
     {
       id: "admin",
-      title: "Administrator Approval",
+      title: "Administrator Authorization",
       module: "Admin Branch",
       actor: "Administrator",
-      artifact: "Kind 105 Admin Approval",
+      artifact: "Kind 105 Administrator Authorization",
       kindLabel: "Kind 105",
       summary: "High-value transfers require administrator passkey signature before the verifier can re-approve them.",
       status: input.adminApprovalEvent
@@ -3678,9 +5948,9 @@ function buildFlowStages(input: {
       statusLabel: input.adminApprovalEvent
         ? "Signed"
         : verifierEscalated
-          ? "Awaiting Admin"
+          ? "Admin Review"
           : input.requiresAdmin
-            ? "Pending"
+            ? "Up next"
             : "Not Needed",
       checks: [
         "Admin role authorization",
@@ -3695,12 +5965,12 @@ function buildFlowStages(input: {
     },
     {
       id: "agent_forward",
-      title: "Agent Forwards Approved Package",
+      title: "Execution Package Relay",
       module: "Agent",
       actor: "Agent -> MCP",
-      artifact: "Verifier-Approved Execution Package",
-      kindLabel: "Agent Relay",
-      summary: "After verifier approval, the agent forwards the verifier-signed decision package to the MCP bank interface.",
+      artifact: "Kind 104 Execution Relay Package",
+      kindLabel: "Kind 104",
+      summary: "After verifier approval, the agent relays the verifier-signed decision package to the MCP bank interface for automatic execution.",
       status: input.executionEvent
         ? "done"
         : verifierRejected
@@ -3711,10 +5981,10 @@ function buildFlowStages(input: {
       statusLabel: input.executionEvent
         ? "Forwarded"
         : verifierRejected
-          ? "Blocked"
+          ? "Unavailable"
           : verifierApproved
-            ? "Ready To Forward"
-            : "Pending",
+            ? "Relaying"
+            : "Up next",
       checks: [
         "Verifier signature present",
         "Execution package references current flow",
@@ -3728,12 +5998,12 @@ function buildFlowStages(input: {
     },
     {
       id: "execution",
-      title: "MCP Executes Transfer",
+      title: "Transfer Execution",
       module: "MCP",
       actor: "MCP Bank",
       artifact: "Kind 109 Execution Event",
       kindLabel: "Kind 109",
-      summary: "The bank transfer interface executes the approved payment and emits settlement evidence.",
+      summary: "The bank transfer interface automatically executes the approved payment and emits settlement evidence.",
       status: input.executionEvent
         ? "done"
         : verifierRejected
@@ -3744,10 +6014,10 @@ function buildFlowStages(input: {
       statusLabel: input.executionEvent
         ? "Executed"
         : verifierRejected
-          ? "Blocked"
+          ? "Unavailable"
           : verifierApproved
-            ? "Ready"
-            : "Pending",
+            ? "Auto Executing"
+            : "Up next",
       checks: [
         "Verifier-approved package accepted",
         "Balances updated in bank ledger",
@@ -3761,7 +6031,7 @@ function buildFlowStages(input: {
     },
     {
       id: "archive",
-      title: "Independent Archive",
+      title: "Archive Record",
       module: "Archive",
       actor: "Archive Service",
       artifact: "Kind 106 Archive Record",
@@ -3772,7 +6042,7 @@ function buildFlowStages(input: {
         : input.instructionEvent || input.envelopeEvent || input.firstVerifierEvent || input.executionEvent
           ? "current"
           : "pending",
-      statusLabel: input.archiveRecord ? "Archived" : input.instructionEvent ? "Appending" : "Pending",
+      statusLabel: input.archiveRecord ? "Archived" : input.instructionEvent ? "Appending" : "Up next",
       checks: [
         "Append-only write path",
         "Hash chain continuity",
@@ -3798,6 +6068,8 @@ function getFlowStageDetailSections(
     archiveRecord?: ArchiveRecord;
     agentTrace: AgentTrace | null;
     policyView: VerifierPolicyView | null;
+    amount: string;
+    currency: string;
     status: string;
     transferorPrincipalId: string;
     adminPrincipalId: string;
@@ -3812,16 +6084,19 @@ function getFlowStageDetailSections(
 > {
   switch (stage.id) {
     case "instruction":
+      const instructionContent = input.instructionEvent?.payload.content as Record<string, unknown> | undefined;
+      const instructionAmount = String(instructionContent?.amount ?? input.amount ?? "unknown");
+      const instructionCurrency = String(instructionContent?.currency ?? input.currency ?? "USD");
       return [
         {
           title: "Step Summary",
           type: "rows",
           rows: [
             { label: "What happens here", value: "Human signs the transfer instruction with passkey-backed identity proof" },
+            { label: "Transfer amount", value: `${instructionCurrency} ${instructionAmount}` },
             { label: "Current status", value: stage.statusLabel },
-            { label: "Transferor Principal", value: input.transferorPrincipalId },
             { label: "Recipient Principal", value: input.recipientPrincipalId },
-            { label: "Primary handoff", value: "Signed Kind 101 instruction -> Agent" },
+            { label: "Primary handoff", value: "Kind 101 transfer instruction -> Agent" },
           ],
         },
         {
@@ -3865,8 +6140,6 @@ function getFlowStageDetailSections(
                   " -> ",
                 ),
             },
-            { label: "Execution started", value: formatAgentTimestamp(input.agentTrace?.startedAt) },
-            { label: "Execution duration", value: formatDurationMs(input.agentTrace?.durationMs) },
           ],
         },
         {
@@ -3929,7 +6202,7 @@ function getFlowStageDetailSections(
                 : "When transfer exceeds active policy threshold",
             },
             { label: "Current status", value: stage.statusLabel },
-            { label: "Admin action", value: "Administrator passkey signature is attached and sent back for verifier re-check" },
+            { label: "Authorization result", value: "Administrator passkey signature is attached and returned for verifier re-check" },
           ],
         },
         {
@@ -3959,14 +6232,14 @@ function getFlowStageDetailSections(
     case "agent_forward":
       return [
         {
-          title: "Forwarding Package",
+          title: "Execution Relay",
           type: "rows",
           rows: [
             { label: "Transferor Principal", value: input.transferorPrincipalId },
             { label: "Recipient Principal", value: input.recipientPrincipalId },
             { label: "Agent Principal", value: DEMO_PRINCIPALS.agent },
             { label: "Verifier Principal", value: DEMO_PRINCIPALS.verifier },
-            { label: "Routing", value: "Agent receives verifier-approved decision and forwards execution package to MCP" },
+            { label: "Routing", value: "Agent receives the verifier-approved decision and relays the execution package to MCP" },
             { label: "Why agent forwards", value: "Keeps orchestration consistent: human -> agent -> verifier -> agent -> MCP" },
             { label: "Current engine status", value: input.status },
           ],
@@ -3998,7 +6271,7 @@ function getFlowStageDetailSections(
     case "execution":
       return [
         {
-          title: "Execution Gate",
+          title: "Automatic Execution",
           type: "rows",
           rows: [
             { label: "Transferor Principal", value: input.transferorPrincipalId },
@@ -4006,7 +6279,7 @@ function getFlowStageDetailSections(
             { label: "Agent Principal", value: DEMO_PRINCIPALS.agent },
             { label: "Verifier Principal", value: DEMO_PRINCIPALS.verifier },
             { label: "Required input", value: "Verifier-approved decision package" },
-            { label: "Execution rule", value: "MCP can execute only after verifier approval or re-verification" },
+            { label: "Execution rule", value: "MCP executes automatically after verifier approval or re-verification" },
             { label: "Current status", value: stage.statusLabel },
           ],
         },
@@ -4108,12 +6381,12 @@ function buildTraceSteps(input: {
 
   return [
     {
-      label: "Kind 101 Signed Instruction",
+      label: "Kind 101 Transfer Instruction",
       description: "Transferor signs the original payment instruction with passkey-backed proof.",
       eventId: input.instructionEvent?.eventId,
       targetDomId: input.instructionEvent ? getEventCardDomId(input.instructionEvent.eventId) : undefined,
       status: input.instructionEvent ? "done" : "current",
-      statusLabel: input.instructionEvent ? "Done" : "Waiting",
+      statusLabel: input.instructionEvent ? "Done" : "Active",
     },
     {
       label: "Kind 102 Governance Envelope",
@@ -4121,20 +6394,20 @@ function buildTraceSteps(input: {
       eventId: input.envelopeEvent?.eventId,
       targetDomId: input.envelopeEvent ? getEventCardDomId(input.envelopeEvent.eventId) : undefined,
       status: input.envelopeEvent ? "done" : input.instructionEvent ? "current" : "pending",
-      statusLabel: input.envelopeEvent ? "Done" : input.instructionEvent ? "Waiting" : "Pending",
+      statusLabel: input.envelopeEvent ? "Done" : input.instructionEvent ? "Active" : "Up next",
     },
     {
-      label: "First Verifier Decision",
+      label: "Kind 103/104 Verification Decision",
       description: "Verifier evaluates policy, identity proof, recipient constraints, and risk tier.",
       eventId: input.firstVerifierEvent?.eventId,
       targetDomId: input.firstVerifierEvent
         ? getEventCardDomId(input.firstVerifierEvent.eventId)
         : undefined,
       status: input.firstVerifierEvent ? "done" : input.envelopeEvent ? "current" : "pending",
-      statusLabel: input.firstVerifierEvent ? "Done" : input.envelopeEvent ? "Waiting" : "Pending",
+      statusLabel: input.firstVerifierEvent ? "Done" : input.envelopeEvent ? "Active" : "Up next",
     },
     {
-      label: "Kind 105 Admin Signature",
+      label: "Kind 105 Administrator Authorization",
       description: firstDecisionIsEscalate
         ? "Administrator signs the high-value transfer approval."
         : "Only required when the first verifier decision escalates.",
@@ -4150,8 +6423,8 @@ function buildTraceSteps(input: {
       statusLabel: input.adminApprovalEvent
         ? "Done"
         : firstDecisionIsEscalate
-          ? "Waiting"
-          : "Skipped",
+          ? "Active"
+          : "Not used",
     },
     {
       label: "Kind 107 Re-Verification",
@@ -4170,13 +6443,13 @@ function buildTraceSteps(input: {
       statusLabel: input.reverifyEvent
         ? "Done"
         : input.adminApprovalEvent
-          ? "Waiting"
+          ? "Active"
           : firstDecisionIsEscalate
-            ? "Pending"
-            : "Skipped",
+            ? "Up next"
+            : "Not used",
     },
     {
-      label: "Kind 108 Reject Branch",
+      label: "Kind 108 Rejection Decision",
       description: "If policy or proof validation fails, the flow halts with a signed rejection event.",
       eventId: input.rejectEvent?.eventId,
       targetDomId: input.rejectEvent ? getEventCardDomId(input.rejectEvent.eventId) : undefined,
@@ -4188,8 +6461,8 @@ function buildTraceSteps(input: {
       statusLabel: input.rejectEvent ? "Triggered" : "Not Used",
     },
     {
-      label: "Kind 109 Bank Execution",
-      description: "MCP bank executes the approved transfer and writes the execution evidence event.",
+      label: "Kind 109 Execution Event",
+      description: "MCP bank executes the approved transfer automatically and writes the execution evidence event.",
       eventId: input.executionEvent?.eventId,
       targetDomId: input.executionEvent ? getEventCardDomId(input.executionEvent.eventId) : undefined,
       status: input.executionEvent
@@ -4202,10 +6475,10 @@ function buildTraceSteps(input: {
       statusLabel: input.executionEvent
         ? "Done"
         : input.rejectEvent
-          ? "Blocked"
+          ? "Unavailable"
           : input.reverifyEvent || input.firstVerifierEvent?.kind === 103
-            ? "Ready"
-            : "Pending",
+            ? "Active"
+            : "Up next",
     },
     {
       label: "Kind 106 Archive Record",
@@ -4213,7 +6486,7 @@ function buildTraceSteps(input: {
       eventId: latestArchive?.id,
       targetDomId: latestArchive ? getArchiveCardDomId(latestArchive.id) : undefined,
       status: latestArchive ? "done" : archiveReady ? "current" : "pending",
-      statusLabel: latestArchive ? "Done" : archiveReady ? "Waiting" : "Pending",
+      statusLabel: latestArchive ? "Done" : archiveReady ? "Active" : "Up next",
     },
   ];
 }

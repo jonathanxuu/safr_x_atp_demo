@@ -137,7 +137,7 @@ function createExecutionEventPayload(input: {
     id: `evt_exec_${input.transaction.transactionId}_hash`,
     kind: 109,
     ai_id: "mcp_bank_demo_01",
-    created_at: Math.floor(Date.now() / 1000),
+    created_at: Date.now(),
     tags: [
       ["flow_id", input.flowId],
       ["source", "mcp-bank"],
@@ -366,7 +366,7 @@ const server = createServer(async (request, response) => {
       });
     } catch (error) {
       sendJson(response, 400, {
-        error: error instanceof Error ? error.message : "Failed to execute transfer",
+        error: error instanceof Error ? error.message : "Failed to complete automatic transfer execution",
       });
     }
     return;

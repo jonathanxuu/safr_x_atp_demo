@@ -505,20 +505,28 @@ export class EventRepository {
       throw new Error(`Unsupported event kind: ${payload.kind}`);
     }
 
-    const existing = this.db
-      .prepare("SELECT id FROM event_events WHERE id = ?")
-      .get(payload.id) as { id?: string } | undefined;
-    if (existing?.id) {
-      throw new Error(`Event already exists: ${payload.id}`);
-    }
-
-    const record = createEventRecord(input);
-    const payloadJson = JSON.stringify(record.payload);
-    const payloadHash = hashJson(record.payload);
-    const signatureJson = extractSignatureJson(record.payload as BaseEventEnvelope<Record<string, unknown>>);
-
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      const existing = this.db
+        .prepare("SELECT id FROM event_events WHERE id = ?")
+        .get(payload.id) as { id?: string } | undefined;
+      if (existing?.id) {
+        throw new Error(`Event already exists: ${payload.id}`);
+      }
+
+      const createdAt = this.nextCreatedAt(input.flowId, payload.created_at);
+      const normalizedPayload = {
+        ...payload,
+        created_at: createdAt,
+      };
+      const record = createEventRecord({
+        ...input,
+        payload: normalizedPayload,
+      });
+      const payloadJson = JSON.stringify(record.payload);
+      const payloadHash = hashJson(record.payload);
+      const signatureJson = extractSignatureJson(record.payload as BaseEventEnvelope<Record<string, unknown>>);
+
       this.db
         .prepare(`
           INSERT INTO event_events (
@@ -557,6 +565,30 @@ export class EventRepository {
     }
   }
 
+  private nextCreatedAt(flowId: string, incomingCreatedAt: number) {
+    const normalizedIncoming = incomingCreatedAt < 1000000000000 ? incomingCreatedAt * 1000 : incomingCreatedAt;
+    const lastRecord = this.db
+      .prepare(`
+        SELECT created_at
+        FROM event_events
+        WHERE flow_id = ?
+        ORDER BY
+          CASE
+            WHEN created_at < 1000000000000 THEN created_at * 1000
+            ELSE created_at
+          END DESC,
+          id DESC
+        LIMIT 1
+      `)
+      .get(flowId) as { created_at?: number } | undefined;
+
+    const lastCreatedAt = typeof lastRecord?.created_at === "number"
+      ? (lastRecord.created_at < 1000000000000 ? lastRecord.created_at * 1000 : lastRecord.created_at)
+      : 0;
+
+    return Math.max(normalizedIncoming, lastCreatedAt + 1);
+  }
+
   get(eventId: string): EventRecord | undefined {
     const row = this.db
       .prepare(`
@@ -588,7 +620,12 @@ export class EventRepository {
         SELECT id, flow_id, kind, ai_id, created_at, instruction_ref, envelope_ref, payload_json
         FROM event_events
         ${whereClause}
-        ORDER BY created_at ASC, id ASC
+        ORDER BY
+          CASE
+            WHEN created_at < 1000000000000 THEN created_at * 1000
+            ELSE created_at
+          END ASC,
+          id ASC
       `)
       .all(...args) as unknown as EventEventRow[];
 
@@ -659,7 +696,7 @@ export class ArchiveRepository {
       id: `evt_archive_${String(appendOnlyIndex).padStart(4, "0")}_hash`,
       kind: 106,
       ai_id: "archive_service_demo_01",
-      created_at: Math.floor(Date.now() / 1000),
+      created_at: Date.now(),
       tags: [
         ["flow_id", flowId],
         ["stage", "archive_written"],
