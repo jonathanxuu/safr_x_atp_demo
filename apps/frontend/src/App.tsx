@@ -404,6 +404,7 @@ export function App() {
   const persistedFlowSnapshot = readPersistedFlowSnapshot();
   const [authReady, setAuthReady] = useState(false);
   const [activeAccount, setActiveAccount] = useState<ActiveAccount | null>(null);
+  const [passkeyStatusReady, setPasskeyStatusReady] = useState(false);
   const [accountUsernameInput, setAccountUsernameInput] = useState("");
   const [accountPasswordInput, setAccountPasswordInput] = useState("");
   const [authError, setAuthError] = useState("");
@@ -481,8 +482,10 @@ export function App() {
   const recipientPrincipalId = activeAccount?.recipientPrincipalId ?? DEMO_PRINCIPALS.recipient;
   const activeUsername = activeAccount?.username ?? "";
   const activeAccountLabel = activeUsername || "demo";
-  const passkeySetupIncomplete = !passkeyTransferor.registered || !passkeyAdmin.registered;
-  const showPasskeyOnboarding = passkeySetupIncomplete;
+  const passkeyStatusLoading = Boolean(activeAccount) && !passkeyStatusReady;
+  const passkeySetupIncomplete =
+    passkeyStatusReady && (!passkeyTransferor.registered || !passkeyAdmin.registered);
+  const showPasskeyOnboarding = passkeyStatusReady && passkeySetupIncomplete;
   const missingPasskeyRoles = [
     !passkeyTransferor.registered ? "Transferor passkey" : null,
     !passkeyAdmin.registered ? "Administrator passkey" : null,
@@ -623,6 +626,8 @@ export function App() {
                 : "Not started";
   const currentStateSummary = passkeySetupIncomplete
     ? "Passkey setup needed"
+    : passkeyStatusLoading
+      ? "Checking signer passkeys"
     : executionEvent
       ? "Flow executed"
       : canExecute
@@ -997,13 +1002,21 @@ export function App() {
 
   async function refreshPasskeys() {
     if (!activeAccount) {
+      setPasskeyStatusReady(false);
       return;
     }
 
-    await Promise.all([
-      fetchPasskeyStatus(transferorPrincipalId, "transferor"),
-      fetchPasskeyStatus(adminPrincipalId, "admin"),
-    ]);
+    setPasskeyStatusReady(false);
+    try {
+      await Promise.all([
+        fetchPasskeyStatus(transferorPrincipalId, "transferor"),
+        fetchPasskeyStatus(adminPrincipalId, "admin"),
+      ]);
+      setPasskeyStatusReady(true);
+    } catch (error) {
+      setPasskeyStatusReady(true);
+      throw error;
+    }
   }
 
   async function fetchAccounts() {
@@ -1321,6 +1334,7 @@ export function App() {
       }
 
       setActiveAccount(body.account);
+      setPasskeyStatusReady(false);
       setPasskeyTransferor(createEmptyPasskeyState());
       setPasskeyAdmin(createEmptyPasskeyState());
       setAccountPasswordInput("");
@@ -1337,6 +1351,7 @@ export function App() {
   async function handleLogout() {
     await fetchIdentity("/auth/logout", { method: "POST" });
     setActiveAccount(null);
+    setPasskeyStatusReady(false);
     setAccountUsernameInput("");
     setAccountPasswordInput("");
     setPasskeyTransferor(createEmptyPasskeyState());
@@ -1391,6 +1406,10 @@ export function App() {
   }
 
   function getMissingPasskeyMessage() {
+    if (!passkeyStatusReady) {
+      return "Checking passkey status. Please wait a moment and try again.";
+    }
+
     const missing: string[] = [];
 
     if (!passkeyTransferor.registered) {
