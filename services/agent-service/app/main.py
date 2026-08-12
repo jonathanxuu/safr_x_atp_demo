@@ -71,6 +71,11 @@ class ExecuteTransferRequest(BaseModel):
     currency: str
 
 
+class ReviewReasoningRequest(BaseModel):
+    flowId: str
+    payload: dict[str, Any]
+
+
 async def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(url, json=payload)
@@ -260,6 +265,15 @@ def build_envelope_payload(
             f"{bundle.get('bundleId', 'bundle_demo_finance_001')}@{bundle.get('bundleVersion', '1.0.0')}",
         ),
         "origin_sig": request.transferorPasskey.get("proofRef", ""),
+        "analysis": {
+            "input_payload": plan_context.get("input_payload", ""),
+            "prompt_text": plan_context.get("prompt_text", ""),
+            "prompt_preview": plan_context.get("prompt_preview", ""),
+            "reasoning": plan_context.get("reasoning", ""),
+            "next_step": plan_context.get("next_step", ""),
+            "policy_decision": plan_context.get("policy_decision", ""),
+            "logic_checks": plan_context.get("logic_checks", []),
+        },
     }
     signing_material = signer.sign_envelope(content)
     content["agent_signature"] = signing_material
@@ -334,10 +348,16 @@ async def evaluate_transfer(request: EvaluateTransferRequest) -> dict[str, Any]:
     )
     plan_context = {
         "mode": plan.mode,
-        "reasoning_summary": plan.reasoning_summary,
+        "reasoning": plan.reasoning,
+        "next_step": plan.next_step,
+        "policy_decision": plan.policy_decision,
+        "logic_checks": plan.logic_checks,
         "tool_calls": plan.tool_calls,
         "context_metadata": plan.context_metadata,
         "control_bundle_v": plan.control_bundle_v,
+        "prompt_text": plan.prompt_text,
+        "prompt_preview": plan.prompt_preview,
+        "input_payload": plan.input_payload,
     }
 
     envelope_payload = build_envelope_payload(
@@ -362,13 +382,15 @@ async def evaluate_transfer(request: EvaluateTransferRequest) -> dict[str, Any]:
     return {
         "agent": {
             "mode": plan.mode,
-            "reasoning_summary": plan.reasoning_summary,
+            "reasoning": plan.reasoning,
+            "next_step": plan.next_step,
             "tool_calls": plan.tool_calls,
             "started_at": plan.started_at,
             "completed_at": plan.completed_at,
             "duration_ms": plan.duration_ms,
             "prompt_text": plan.prompt_text,
             "prompt_preview": plan.prompt_preview,
+            "input_payload": plan.input_payload,
             "skill_name": plan.skill_name,
             "mandatory_tools": plan.mandatory_tools,
             "fallback_reason": plan.fallback_reason,
@@ -438,6 +460,17 @@ async def execute_transfer(request: ExecuteTransferRequest) -> dict[str, Any]:
             "currency": request.currency,
         },
     )
+
+
+@app.post("/review-reasoning")
+async def review_reasoning(request: ReviewReasoningRequest) -> dict[str, Any]:
+    review = planner.review_reasoning(request.payload)
+    if isinstance(review, dict) and "review_mode" not in review:
+        review["review_mode"] = planner.mode if not review.get("fallback_reason") else "deterministic"
+    return {
+        "flowId": request.flowId,
+        "review": review,
+    }
 
 
 if __name__ == "__main__":

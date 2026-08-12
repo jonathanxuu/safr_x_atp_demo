@@ -162,7 +162,7 @@ start_service \
   "agent-service" \
   "4106" \
   "http://localhost:4106/health" \
-  "cd '$ROOT_DIR/services/agent-service' && source .venv/bin/activate && uvicorn app.main:app --host 0.0.0.0 --port 4106"
+  "cd '$ROOT_DIR/services/agent-service' && source .venv/bin/activate && unset GEMINI_API_KEY GOOGLE_API_KEY && GOOGLE_GENAI_USE_VERTEXAI='true' uvicorn app.main:app --host 0.0.0.0 --port 4106"
 
 start_service \
   "frontend" \

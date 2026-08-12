@@ -9,6 +9,7 @@ import {
   type CreateEventInput,
   type EventRecord,
   type SupportedEventKind,
+  createAccountScopedPrincipal,
   createEventRecord,
   inferFlowId,
   isSupportedEventKind,
@@ -360,7 +361,7 @@ const migrations = [
 
     UPDATE bank_accounts
     SET owner_id = '${DEMO_PRINCIPALS.recipient}'
-    WHERE owner_id = 'usr_recipient_bob';
+    WHERE owner_role = 'recipient' AND owner_id LIKE 'usr_recipient_%';
 
     UPDATE identity_principals
     SET principal_id = '${DEMO_PRINCIPALS.transferor}'
@@ -444,6 +445,17 @@ const migrations = [
 
     CREATE INDEX IF NOT EXISTS idx_auth_sessions_username
       ON auth_sessions (username, created_at DESC);
+    `,
+  },
+  {
+    version: 8,
+    name: "remove_builtin_recipient_demo_account",
+    sql: `
+    DELETE FROM bank_accounts
+    WHERE owner_role = 'recipient'
+      AND owner_id = '${DEMO_PRINCIPALS.recipient}'
+      AND currency = 'USD'
+      AND available_balance = 3200;
     `,
   },
 ];
@@ -783,6 +795,7 @@ export class ArchiveRepository {
 export class BankRepository {
   constructor(private readonly db: DatabaseSync) {
     this.seedDefaults();
+    this.ensureAuthAccountRecipientAccounts();
   }
 
   ensureAccount(input: {
@@ -1098,7 +1111,25 @@ export class BankRepository {
     `);
 
     insert.run("acct_transferor_alice_001", DEMO_PRINCIPALS.transferor, "transferor", "USD", 25000, now);
-    insert.run("acct_recipient_bob_001", DEMO_PRINCIPALS.recipient, "recipient", "USD", 3200, now);
+  }
+
+  private ensureAuthAccountRecipientAccounts() {
+    const rows = this.db
+      .prepare(`
+        SELECT username
+        FROM auth_accounts
+        ORDER BY username ASC
+      `)
+      .all() as Array<{ username: string }>;
+
+    for (const row of rows) {
+      const recipientPrincipalId = createAccountScopedPrincipal(row.username, "recipient");
+      this.ensureAccount({
+        ownerId: recipientPrincipalId,
+        ownerRole: "recipient",
+        currency: "USD",
+      });
+    }
   }
 }
 

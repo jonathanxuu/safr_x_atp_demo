@@ -20,6 +20,8 @@ import {
 const port = Number(process.env.PORT ?? 4103);
 const eventServiceBaseUrl = process.env.EVENT_SERVICE_URL ?? "http://localhost:4101";
 const archiveServiceBaseUrl = process.env.ARCHIVE_SERVICE_URL ?? "http://localhost:4102";
+const verifierServiceBaseUrl = process.env.VERIFIER_SERVICE_URL ?? `http://localhost:${port}`;
+const agentServiceBaseUrl = process.env.AGENT_SERVICE_URL ?? "http://localhost:4106";
 const identityServiceBaseUrl = process.env.IDENTITY_SERVICE_URL ?? "http://localhost:4105";
 const mcpBankBaseUrl = process.env.MCP_BANK_URL ?? "http://localhost:4104";
 const verifierDir = resolve(process.cwd(), "keys");
@@ -152,6 +154,39 @@ interface ToolTraceContent {
   trace_sig_alg?: string;
   trace_signer?: string;
   trace_key_id?: string;
+}
+
+interface ReasonCheckReport {
+  verdict?: "pass" | "observe" | "fail";
+  recommended_outcome?: "auto_execute" | "escalate" | "deny" | "observe";
+  summary?: string;
+  findings?: string[];
+  logic_checks?: Array<{
+    name?: string;
+    status?: "pass" | "warn" | "fail";
+    detail?: string;
+  }>;
+  observed_signals?: string[];
+  model_note?: string;
+  review_prompt?: string;
+  fallback_reason?: string;
+  review_mode?: "adk" | "deterministic";
+}
+
+function alignReasonCheckToDisposition(
+  reasonCheck: ReasonCheckReport | undefined,
+  outcome: "auto_execute" | "escalate" | "deny" | "observe",
+  summary: string,
+): ReasonCheckReport | undefined {
+  if (!reasonCheck) {
+    return reasonCheck;
+  }
+
+  return {
+    ...reasonCheck,
+    recommended_outcome: outcome,
+    summary,
+  };
 }
 
 function sendJson(response: import("node:http").ServerResponse, status: number, body: unknown) {
@@ -323,6 +358,16 @@ async function fetchBankAccount(accountId: string): Promise<BankAccountRecord | 
   return body.account ?? null;
 }
 
+async function fetchRecipientAllowlist(principalId: string): Promise<BankAccountRecord[]> {
+  const response = await fetch(`${mcpBankBaseUrl}/accounts?ownerId=${encodeURIComponent(principalId)}`);
+  if (!response.ok) {
+    throw new Error(`Failed to load recipient allowlist for ${principalId}: ${response.status}`);
+  }
+  const body = (await response.json()) as { accounts?: BankAccountRecord[] };
+  const accounts = Array.isArray(body.accounts) ? body.accounts : [];
+  return accounts.filter((account) => account.ownerId === principalId && account.ownerRole === "recipient");
+}
+
 function canonicalStringify(value: unknown): string {
   if (typeof value === "string") {
     return asciiJsonStringify(value);
@@ -360,6 +405,7 @@ function buildEnvelopeSigningPayload(envelope: BaseEventEnvelope<UnknownContent>
     context_metadata: content.context_metadata,
     control_bundle_v: content.control_bundle_v,
     origin_sig: content.origin_sig,
+    analysis: content.analysis,
   };
 }
 
@@ -668,6 +714,325 @@ function buildInstructionPayloadHashOrThrow(instructionRecord: EventServiceRecor
   return computedHash;
 }
 
+function buildReasonCheckInput(input: {
+  flowId: string;
+  envelopeRecord: EventServiceRecord;
+  instructionRecord: EventServiceRecord;
+  policy: NonNullable<CurrentPolicyResponse["policy"]>;
+  activeBundle: CurrentPolicyResponse["bundle"];
+  validationOverrides?: {
+    policyDecision?: string;
+    finalResult?: string;
+    reasoningNotes?: string[];
+    extraLogicChecks?: Array<{ name: string; status: "pass" | "warn" | "fail"; detail: string }>;
+    validationSignals?: Record<string, unknown>;
+  };
+}) {
+  const envelopeContent = input.envelopeRecord.payload.content as Record<string, unknown>;
+  const analysis = (envelopeContent.analysis as Record<string, unknown> | undefined) ?? {};
+  const agentSignature = (envelopeContent.agent_signature as Record<string, unknown> | undefined) ?? {};
+  const reasonCheckPrompt = String(analysis.reason_check_prompt ?? analysis.review_prompt ?? "");
+  const signedPayload = String(agentSignature.signed_payload ?? envelopeContent.signed_payload ?? "");
+  const signedPayloadC14n = String(agentSignature.signed_payload_c14n ?? envelopeContent.signed_payload_c14n ?? "");
+  const recipientAccountRef = extractRecipientAccountRef(input.envelopeRecord.payload);
+  const controlBundleV = `${input.activeBundle.bundleId}@${input.activeBundle.bundleVersion}`;
+  const reasoningText = String(analysis.reasoning ?? analysis.reasoning_summary ?? "");
+  const overridePolicyDecision = input.validationOverrides?.policyDecision;
+  const overrideFinalResult = input.validationOverrides?.finalResult;
+  const reasoningNotes = [
+    ...(Array.isArray(analysis.reasoning_notes) ? analysis.reasoning_notes : []),
+    ...((input.validationOverrides?.reasoningNotes ?? []).filter(Boolean)),
+  ];
+  const logicChecks = [
+    ...(Array.isArray(analysis.logic_checks) ? analysis.logic_checks : []),
+    ...(input.validationOverrides?.extraLogicChecks ?? []),
+  ];
+  const contextMetadata = {
+    ...(typeof envelopeContent.context_metadata === "object" && envelopeContent.context_metadata !== null
+      ? (envelopeContent.context_metadata as Record<string, unknown>)
+      : {}),
+    ...(input.validationOverrides?.validationSignals ?? {}),
+  };
+  return {
+    flowId: input.flowId,
+    amount: extractAmount(input.envelopeRecord.payload),
+    currency: extractCurrency(input.envelopeRecord.payload),
+    recipient_account_ref: recipientAccountRef,
+    input_payload: String(analysis.input_payload ?? ""),
+    signed_payload: signedPayload,
+    signed_payload_c14n: signedPayloadC14n,
+    prompt_text: reasonCheckPrompt || String(analysis.prompt_text ?? ""),
+    prompt_preview: String(analysis.prompt_preview ?? ""),
+    reasoning: reasoningText,
+    reasoning_summary: reasoningText,
+    final_result: String(overrideFinalResult ?? analysis.policy_decision ?? analysis.final_result ?? ""),
+    policy_decision: String(overridePolicyDecision ?? analysis.policy_decision ?? analysis.final_result ?? ""),
+    reasoning_confidence: Number(analysis.reasoning_confidence ?? 0),
+    reasoning_notes: reasoningNotes,
+    logic_checks: logicChecks,
+    tool_calls: Array.isArray(envelopeContent.tool_calls) ? envelopeContent.tool_calls : [],
+    context_metadata: contextMetadata,
+    control_bundle_v: controlBundleV,
+    policy: {
+      autoExecuteBelow: input.policy.autoExecuteBelow,
+      adminReviewAtOrAbove: input.policy.adminReviewAtOrAbove,
+      allowedCurrencies: input.policy.allowedCurrencies,
+      recipientAllowlistRequired: input.policy.recipientAllowlistRequired,
+      _amount: extractAmount(input.envelopeRecord.payload),
+    },
+    bundle: {
+      bundleId: input.activeBundle.bundleId,
+      bundleVersion: input.activeBundle.bundleVersion,
+      bundleHash: input.activeBundle.bundleHash,
+    },
+    instruction_ref: input.instructionRecord.eventId,
+    envelope_ref: input.envelopeRecord.eventId,
+  };
+}
+
+function normalizeReasonCheck(review: unknown): ReasonCheckReport | null {
+  if (!review || typeof review !== "object") {
+    return null;
+  }
+
+  const candidate = review as ReasonCheckReport;
+  const verdict = candidate.verdict;
+  const recommendedOutcome = candidate.recommended_outcome;
+  if (
+    verdict !== "pass" &&
+    verdict !== "observe" &&
+    verdict !== "fail"
+  ) {
+    return null;
+  }
+  if (
+    recommendedOutcome !== "auto_execute" &&
+    recommendedOutcome !== "escalate" &&
+    recommendedOutcome !== "deny" &&
+    recommendedOutcome !== "observe"
+  ) {
+    return null;
+  }
+
+  return {
+    verdict,
+    recommended_outcome: recommendedOutcome,
+    summary: typeof candidate.summary === "string" ? candidate.summary : "",
+    findings: Array.isArray(candidate.findings) ? candidate.findings.map((value) => String(value)) : [],
+    logic_checks: Array.isArray(candidate.logic_checks)
+      ? candidate.logic_checks.map((item) => ({
+          name: String(item?.name ?? "check"),
+          status: item?.status === "pass" || item?.status === "warn" || item?.status === "fail" ? item.status : "warn",
+          detail: String(item?.detail ?? ""),
+        }))
+      : [],
+    observed_signals: Array.isArray(candidate.observed_signals)
+      ? candidate.observed_signals.map((value) => String(value))
+      : [],
+    model_note: typeof candidate.model_note === "string" ? candidate.model_note : "",
+    review_prompt: typeof candidate.review_prompt === "string" ? candidate.review_prompt : undefined,
+    fallback_reason: typeof candidate.fallback_reason === "string" ? candidate.fallback_reason : undefined,
+    review_mode:
+      candidate.review_mode === "adk" || candidate.review_mode === "deterministic"
+        ? candidate.review_mode
+        : undefined,
+  };
+}
+
+function buildVerifierReviewPrompt(input: ReturnType<typeof buildReasonCheckInput>): string {
+  const signedPayload = String(input.signed_payload ?? input.signed_payload_c14n ?? "");
+  const signedPayloadExcerpt = signedPayload ? signedPayload.slice(0, 4000) : "No signed payload provided.";
+  const reviewPhase = String(
+    (input.context_metadata as Record<string, unknown> | undefined)?.review_phase ?? "initial_verification",
+  );
+  const isPostAdminReverification = reviewPhase === "post_admin_signature_reverify";
+  return [
+    "You are the verifier for a governed transfer in the SAFR x ATP flow.",
+    "",
+    "Your role is to review the signed transfer packet and produce the verifier's decision record for product, operations, and audit use.",
+    "",
+    "You are not the transfer planner.",
+    "You are not the bank executor.",
+    "Do not restate the transfer agent's prompt.",
+    "Do not invent new facts outside the signed packet and attached evidence.",
+    "",
+    "Review the transfer using the signed artifacts as the source of truth:",
+    "1. the signed instruction from the principal",
+    "2. the pinned policy snapshot and policy constraints",
+    "3. the signed proposal / actual tool intent from the agent",
+    "4. the tool trace, resolved recipient data, and other attached evidence",
+    "5. the declared transfer-side outcome and reasoning, only as supporting context",
+    "",
+    isPostAdminReverification
+      ? "This is a post-administrator-signature re-verification. Confirm that the original packet remains valid and that the validated administrator approval is bound to this exact escalation. Decide only whether execution may proceed, must be denied, or may proceed under observation. Do not request another escalation."
+      : "Your task is to decide whether the transfer can move forward as requested, must pause for escalation, must be denied, or should be allowed to proceed under observation.",
+    "",
+    "Decision meanings:",
+    "- auto_execute: the transfer is consistent, policy-valid, and may continue automatically",
+    isPostAdminReverification
+      ? "- escalate: not permitted in this post-administrator-signature re-verification"
+      : "- escalate: the transfer is not allowed to continue automatically and requires admin approval",
+    "- deny: the transfer is invalid or unsupported and must not proceed",
+    "- observe: the transfer may proceed, but the verifier wants it explicitly flagged for follow-up, anomaly monitoring, or post-run review",
+    "",
+    "Review rules:",
+    "- Treat the signed packet and verifier inputs as the source of truth",
+    "- Prefer evidence over natural-language reasoning",
+    "- If reasoning and evidence disagree, trust the evidence",
+    "- If the declared outcome is unsupported by the signed artifacts or policy facts, do not preserve it",
+    "- Be concise, operational, and audit-friendly",
+    "- Do not claim execution already happened unless execution evidence is present",
+    "",
+    "Return strict JSON only with these keys:",
+    "verdict, recommended_outcome, summary, findings, logic_checks, observed_signals, model_note",
+    "",
+    "Output requirements:",
+    "- verdict must be one of: pass, observe, fail",
+    isPostAdminReverification
+      ? "- recommended_outcome must be one of: auto_execute, deny, observe"
+      : "- recommended_outcome must be one of: auto_execute, escalate, deny, observe",
+    "- summary should read like a product-facing verifier conclusion",
+    "- findings should list the most decision-relevant facts or gaps",
+    "- logic_checks should describe the specific checks performed and whether each passed",
+    "- observed_signals should capture risk or governance signals worth surfacing",
+    "- model_note should briefly state whether this was ADK review or deterministic fallback",
+    "",
+    `Transfer amount: ${input.amount} ${input.currency}`,
+    `Recipient account reference: ${input.recipient_account_ref || "unknown"}`,
+    `Signed payload excerpt: ${signedPayloadExcerpt}`,
+    `Input payload: ${input.input_payload || "No input payload provided"}`,
+    `Reasoning: ${input.reasoning_summary || input.reasoning || "No reasoning provided"}`,
+    `Policy decision: ${input.policy_decision || input.final_result || "observe"}`,
+    `Review phase: ${reviewPhase}`,
+    `Reasoning notes: ${JSON.stringify(input.reasoning_notes ?? [])}`,
+    `Logic checks: ${JSON.stringify(input.logic_checks ?? [])}`,
+    `Tool calls: ${JSON.stringify(input.tool_calls ?? [])}`,
+  ].join("\n");
+}
+
+function reviewReasonCheckLocally(input: ReturnType<typeof buildReasonCheckInput>): ReasonCheckReport {
+  const amount = Number(input.amount);
+  const policy = input.policy;
+  const reasoning = String(input.reasoning ?? input.reasoning_summary ?? "");
+  const signedPayload = String(input.signed_payload ?? input.signed_payload_c14n ?? "");
+  const hasTwoTools = Array.isArray(input.tool_calls) && input.tool_calls.length >= 2;
+  const hasContext = Boolean(input.context_metadata && typeof input.context_metadata === "object");
+  let signedPayloadHasAnalysis = false;
+  let signedPayloadHasOutcome = false;
+  if (signedPayload) {
+    try {
+      const parsed = JSON.parse(signedPayload) as Record<string, unknown>;
+      const parsedAnalysis = parsed.analysis as Record<string, unknown> | undefined;
+      signedPayloadHasAnalysis = Boolean(parsedAnalysis && typeof parsedAnalysis === "object");
+      signedPayloadHasOutcome = Boolean(
+        String(
+          parsed.final_result ??
+          parsed.policy_decision ??
+          parsedAnalysis?.final_result ??
+          parsedAnalysis?.policy_decision ??
+          ""
+        ).trim(),
+      );
+    } catch {
+      signedPayloadHasAnalysis = false;
+      signedPayloadHasOutcome = false;
+    }
+  }
+
+  const logicChecks = [
+    {
+      name: "Signed payload",
+      status: signedPayload && signedPayloadHasAnalysis && signedPayloadHasOutcome ? ("pass" as const) : ("warn" as const),
+      detail:
+        signedPayload && signedPayloadHasAnalysis && signedPayloadHasOutcome
+          ? "Signed payload includes analysis and declared outcome"
+          : "Signed payload is missing analysis or declared outcome",
+    },
+    {
+      name: "Reasoning alignment",
+      status: reasoning.trim() ? ("pass" as const) : ("warn" as const),
+      detail: reasoning.trim() ? "Reasoning is present" : "Reasoning is missing",
+    },
+    {
+      name: "Tool trace",
+      status: hasTwoTools ? ("pass" as const) : ("warn" as const),
+      detail: hasTwoTools ? "Required tools are present" : "Tool trace is incomplete",
+    },
+    {
+      name: "Context metadata",
+      status: hasContext && Boolean(String(input.control_bundle_v ?? "").trim()) ? ("pass" as const) : ("warn" as const),
+      detail:
+        hasContext && Boolean(String(input.control_bundle_v ?? "").trim())
+          ? "Context metadata is present"
+          : "Context metadata is missing",
+    },
+  ];
+
+  const findings = logicChecks.filter((item) => item.status !== "pass").map((item) => item.detail);
+  const policyDecision = String(input.policy_decision ?? "");
+  const finalResult = String(input.final_result ?? "");
+  const outcomeSource = finalResult || policyDecision;
+  const normalizedOutcome =
+    outcomeSource.includes("auto_execute")
+      ? "auto_execute"
+      : outcomeSource.includes("reject")
+      ? "deny"
+      : outcomeSource.includes("admin")
+        ? "escalate"
+        : amount < Number(policy.autoExecuteBelow ?? 1000)
+          ? "auto_execute"
+          : amount >= Number(policy.adminReviewAtOrAbove ?? 1000)
+            ? "escalate"
+            : "observe";
+  const passedCount = logicChecks.filter((item) => item.status === "pass").length;
+  const confidence = Math.min(0.98, Math.max(0.45, passedCount / logicChecks.length + (normalizedOutcome === "deny" ? 0.05 : 0.1)));
+
+  return {
+    verdict: confidence >= 0.75 ? "pass" : confidence >= 0.55 ? "observe" : "fail",
+    recommended_outcome: normalizedOutcome,
+    summary:
+      findings.length === 0
+        ? `Reasoning matches the ${normalizedOutcome} disposition.`
+        : `Reasoning is mostly consistent but has ${findings.length} review signals.`,
+    findings: findings.length > 0 ? findings : [`Reasoning supports ${normalizedOutcome}.`],
+    logic_checks: logicChecks.map((item) => ({ name: item.name, status: item.status, detail: item.detail })),
+    observed_signals: [
+      ...(signedPayload ? ["signed_payload"] : []),
+      ...(signedPayloadHasAnalysis ? ["analysis"] : []),
+      ...(reasoning.trim() ? ["reasoning"] : []),
+    ],
+    model_note: "Local fallback review",
+    review_prompt: buildVerifierReviewPrompt(input),
+    review_mode: "deterministic",
+  };
+}
+
+async function fetchReasonCheck(input: ReturnType<typeof buildReasonCheckInput>): Promise<ReasonCheckReport> {
+  const response = await fetch(`${agentServiceBaseUrl}/review-reasoning`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      flowId: input.flowId,
+      payload: input,
+    }),
+  });
+
+  if (!response.ok) {
+    const body = (await response.json().catch(() => ({}))) as { detail?: string; error?: string };
+    throw new Error(body.detail ?? body.error ?? `Reason check review failed: ${response.status}`);
+  }
+
+  const body = (await response.json()) as { review?: ReasonCheckReport };
+  const normalized = normalizeReasonCheck(body.review);
+  if (!normalized) {
+    throw new Error("Reason check review returned an invalid payload");
+  }
+  return {
+    ...normalized,
+    review_mode: normalized.review_mode ?? (normalized.fallback_reason ? "deterministic" : "adk"),
+  };
+}
+
 function createVerifierEnvelope(
   kind: 103 | 104 | 107 | 108,
   aiId: string,
@@ -718,7 +1083,13 @@ function buildRejectDecision(input: {
   reasonCode: string;
   reasonMessage: string;
   currency?: string;
+  reasonCheck?: ReasonCheckReport;
 }): BaseEventEnvelope<UnknownContent> {
+  const alignedReasonCheck = alignReasonCheckToDisposition(
+    input.reasonCheck,
+    "deny",
+    input.reasonMessage || "The verifier denied this transfer.",
+  );
   return createVerifierEnvelope(108, DEMO_PRINCIPALS.verifier, input.flowId, {
     verifier_record_id: `vrf_reject_${Date.now()}`,
     envelope_ref: input.envelopeRecord.eventId,
@@ -731,14 +1102,80 @@ function buildRejectDecision(input: {
       code: input.reasonCode,
       message: input.reasonMessage,
     },
+    decision_payload: {
+      payload_version: "1.0",
+      canonicalization: "jcs-rfc8785",
+      decision_hash: `sha256:reject_${Date.now()}`,
+      review_outcome: input.reasonCheck?.recommended_outcome ?? "deny",
+      disposition: "deny",
+      signed_decision: "rejected",
+      reject_reason_code: input.reasonCode,
+      reject_reason_message: input.reasonMessage,
+    },
     verification_result: {
       principal_signature_valid: input.reasonCode !== "passkey_verification_failed",
       currency_policy_valid: input.reasonCode !== "currency_not_allowed",
       recipient_account_allowed: input.reasonCode !== "recipient_not_allowlisted",
       envelope_schema_valid: true,
+      reason_check_valid: alignedReasonCheck?.verdict !== "fail",
     },
     policy_context: input.currency ? getOptionalPolicyContext(input.currency) : undefined,
+    reason_check: alignedReasonCheck,
     next_step: "halt_until_new_instruction_or_policy_change",
+  });
+}
+
+async function buildReviewedRejectDecision(input: {
+  flowId: string;
+  envelopeRecord: EventServiceRecord;
+  instructionRecord: EventServiceRecord;
+  policy: NonNullable<CurrentPolicyResponse["policy"]>;
+  activeBundle: CurrentPolicyResponse["bundle"];
+  reasonCode: string;
+  reasonMessage: string;
+  currency?: string;
+  validationSignals?: Record<string, unknown>;
+}) {
+  const reasonCheckInput = buildReasonCheckInput({
+    flowId: input.flowId,
+    envelopeRecord: input.envelopeRecord,
+    instructionRecord: input.instructionRecord,
+    policy: input.policy,
+    activeBundle: input.activeBundle,
+    validationOverrides: {
+      policyDecision: `policy_reject_${input.reasonCode}`,
+      finalResult: "deny",
+      reasoningNotes: [input.reasonMessage],
+      extraLogicChecks: [
+        {
+          name: input.reasonCode.replace(/_/g, " "),
+          status: "fail",
+          detail: input.reasonMessage,
+        },
+      ],
+      validationSignals: {
+        reject_reason_code: input.reasonCode,
+        reject_reason_message: input.reasonMessage,
+        ...(input.validationSignals ?? {}),
+      },
+    },
+  });
+
+  let reasonCheck: ReasonCheckReport;
+  try {
+    reasonCheck = await fetchReasonCheck(reasonCheckInput);
+  } catch {
+    reasonCheck = reviewReasonCheckLocally(reasonCheckInput);
+  }
+
+  return buildRejectDecision({
+    flowId: input.flowId,
+    envelopeRecord: input.envelopeRecord,
+    instructionRecord: input.instructionRecord,
+    reasonCode: input.reasonCode,
+    reasonMessage: input.reasonMessage,
+    currency: input.currency,
+    reasonCheck,
   });
 }
 
@@ -773,10 +1210,12 @@ async function buildFirstDecision(
   }
 
   if (Number.isNaN(numericAmount) || numericAmount <= 0) {
-    return buildRejectDecision({
+    return buildReviewedRejectDecision({
       flowId,
       envelopeRecord,
       instructionRecord,
+      policy,
+      activeBundle,
       reasonCode: "invalid_amount",
       reasonMessage: `Transfer amount ${amount} is invalid`,
       currency,
@@ -784,24 +1223,34 @@ async function buildFirstDecision(
   }
 
   if (!policy.allowedCurrencies.includes(currency)) {
-    return buildRejectDecision({
+    return buildReviewedRejectDecision({
       flowId,
       envelopeRecord,
       instructionRecord,
+      policy,
+      activeBundle,
       reasonCode: "currency_not_allowed",
       reasonMessage: `Currency ${currency} is not allowed by active policy bundle`,
       currency,
+      validationSignals: {
+        currency_allowed: false,
+      },
     });
   }
 
   if (!proofRef) {
-    return buildRejectDecision({
+    return buildReviewedRejectDecision({
       flowId,
       envelopeRecord,
       instructionRecord,
+      policy,
+      activeBundle,
       reasonCode: "passkey_verification_failed",
       reasonMessage: "Transferor passkey proof is missing",
       currency,
+      validationSignals: {
+        passkey_proof_present: false,
+      },
     });
   }
 
@@ -858,13 +1307,18 @@ async function buildFirstDecision(
   try {
     assertInstructionNotExpired(instructionRecord);
   } catch (error) {
-    return buildRejectDecision({
+    return buildReviewedRejectDecision({
       flowId,
       envelopeRecord,
       instructionRecord,
+      policy,
+      activeBundle,
       reasonCode: "instruction_expired",
       reasonMessage: error instanceof Error ? error.message : "Instruction expiry verification failed",
       currency,
+      validationSignals: {
+        instruction_not_expired: false,
+      },
     });
   }
 
@@ -912,13 +1366,18 @@ async function buildFirstDecision(
   try {
     await assertInstructionNonceUnused(instructionRecord);
   } catch (error) {
-    return buildRejectDecision({
+    return buildReviewedRejectDecision({
       flowId,
       envelopeRecord,
       instructionRecord,
+      policy,
+      activeBundle,
       reasonCode: "instruction_nonce_reused",
       reasonMessage: error instanceof Error ? error.message : "Instruction nonce reuse detected",
       currency,
+      validationSignals: {
+        instruction_nonce_unused: false,
+      },
     });
   }
 
@@ -926,34 +1385,92 @@ async function buildFirstDecision(
   try {
     recipientAccount = await fetchBankAccount(recipientAccountRef);
   } catch (error) {
-    return buildRejectDecision({
+    return buildReviewedRejectDecision({
       flowId,
       envelopeRecord,
       instructionRecord,
+      policy,
+      activeBundle,
       reasonCode: "recipient_account_lookup_failed",
       reasonMessage:
         error instanceof Error ? error.message : "Recipient account lookup failed",
       currency,
+      validationSignals: {
+        recipient_account_lookup_ok: false,
+      },
     });
   }
 
-  const resolvedRecipientAccount = recipientAccount;
+  let recipientAllowlist: BankAccountRecord[] = [];
+  try {
+    recipientAllowlist = await fetchRecipientAllowlist(recipientId);
+  } catch (error) {
+    return buildReviewedRejectDecision({
+      flowId,
+      envelopeRecord,
+      instructionRecord,
+      policy,
+      activeBundle,
+      reasonCode: "recipient_allowlist_lookup_failed",
+      reasonMessage:
+        error instanceof Error ? error.message : "Recipient allowlist lookup failed",
+      currency,
+      validationSignals: {
+        recipient_allowlist_lookup_ok: false,
+      },
+    });
+  }
+
   const recipientAccountAllowed =
-    resolvedRecipientAccount !== null &&
-    resolvedRecipientAccount.ownerId === recipientId &&
-    resolvedRecipientAccount.ownerRole === "recipient";
-  const recipientAllowlistReasonMessage = resolvedRecipientAccount
-    ? `Recipient account ${recipientAccountRef} belongs to ${resolvedRecipientAccount.ownerId}, not the current recipient principal`
-    : `Recipient account ${recipientAccountRef} is not in the allowlist`;
+    recipientAccount !== null &&
+    recipientAllowlist.some((account) => account.accountId === recipientAccountRef);
+  const recipientAllowlistReasonMessage = recipientAccount
+    ? `Recipient principal ${recipientId} does not control allowlisted account ${recipientAccountRef}. Allowed accounts: ${recipientAllowlist.map((account) => account.accountId).join(", ") || "none"}`
+    : `Recipient account ${recipientAccountRef} is not a valid recipient account`;
 
   if (policy.recipientAllowlistRequired && !recipientAccountAllowed) {
+    return buildReviewedRejectDecision({
+      flowId,
+      envelopeRecord,
+      instructionRecord,
+      policy,
+      activeBundle,
+      reasonCode: "recipient_not_allowlisted",
+      reasonMessage: recipientAllowlistReasonMessage,
+      currency,
+      validationSignals: {
+        recipient_account_allowed: false,
+        recipient_allowlist_required: true,
+        recipient_allowlist_reason: recipientAllowlistReasonMessage,
+      },
+    });
+  }
+
+  const reasonCheckInput = buildReasonCheckInput({
+    flowId,
+    envelopeRecord,
+    instructionRecord,
+    policy,
+    activeBundle,
+  });
+  let reasonCheck: ReasonCheckReport;
+  try {
+    reasonCheck = await fetchReasonCheck(reasonCheckInput);
+  } catch {
+    reasonCheck = reviewReasonCheckLocally(reasonCheckInput);
+  }
+  const reasonCheckVerdict = String(reasonCheck.verdict ?? "");
+  const reasonCheckRecommendedOutcome = String(reasonCheck.recommended_outcome ?? "");
+
+  if (reasonCheckVerdict === "fail" || reasonCheckRecommendedOutcome === "deny") {
     return buildRejectDecision({
       flowId,
       envelopeRecord,
       instructionRecord,
-      reasonCode: "recipient_not_allowlisted",
-      reasonMessage: recipientAllowlistReasonMessage,
+      reasonCode: "reason_check_failed",
+      reasonMessage: reasonCheck.summary || "Reasoning review failed",
       currency,
+      reasonCheck,
     });
   }
 
@@ -974,6 +1491,7 @@ async function buildFirstDecision(
       control_bundle_hash_valid: true,
       orchestrator_trace_signature_valid: Boolean(traceVerification?.valid),
       envelope_hash_valid: true,
+      reason_check_passed: reasonCheckVerdict !== "fail",
     },
     risk_summary: {
       amount,
@@ -1014,6 +1532,8 @@ async function buildFirstDecision(
           tool_name: trace.toolName,
         })) ?? [],
     },
+    reason_check: reasonCheck,
+    reason_check_input: reasonCheckInput,
     decision_payload: {
       payload_version: "1.0",
       canonicalization: "jcs-rfc8785",
@@ -1021,21 +1541,67 @@ async function buildFirstDecision(
     },
   };
 
+  if (reasonCheckRecommendedOutcome === "observe" && numericAmount < policy.adminReviewAtOrAbove) {
+    const alignedReasonCheck = alignReasonCheckToDisposition(
+      reasonCheck,
+      "observe",
+      "The transfer may proceed, but the verifier flagged it for follow-up and monitoring.",
+    );
+    return createVerifierEnvelope(103, DEMO_PRINCIPALS.verifier, flowId, {
+      verifier_record_id: `vrf_observe_${Date.now()}`,
+      ...common,
+      reason_check: alignedReasonCheck,
+      decision: "approved_under_observation",
+      safr_disposition_equivalent: "observe",
+      decision_payload: {
+        ...common.decision_payload,
+        review_outcome: "observe",
+      },
+      observation_flags: {
+        monitoring_required: true,
+        follow_up_required: true,
+        signals: reasonCheck.observed_signals ?? [],
+        findings: reasonCheck.findings ?? [],
+      },
+      next_step: "mcp_transfer_api_may_execute_with_observation_flag",
+    });
+  }
+
   if (numericAmount < policy.autoExecuteBelow) {
+    const alignedReasonCheck = alignReasonCheckToDisposition(
+      reasonCheck,
+      "auto_execute",
+      "The transfer is compliant with policy and may continue automatically.",
+    );
     return createVerifierEnvelope(103, DEMO_PRINCIPALS.verifier, flowId, {
       verifier_record_id: `vrf_approved_${Date.now()}`,
       ...common,
+      reason_check: alignedReasonCheck,
       decision: "approved_auto_execute",
       safr_disposition_equivalent: "auto_execute",
+      decision_payload: {
+        ...common.decision_payload,
+        review_outcome: "auto_execute",
+      },
       next_step: "mcp_transfer_api_may_execute",
     });
   }
 
+  const alignedReasonCheck = alignReasonCheckToDisposition(
+    reasonCheck,
+    "escalate",
+    "The transfer is policy-compliant but requires administrator approval before execution.",
+  );
   return createVerifierEnvelope(104, DEMO_PRINCIPALS.verifier, flowId, {
     verifier_record_id: `vrf_escalate_${Date.now()}`,
     ...common,
+    reason_check: alignedReasonCheck,
     decision: "approved_pending_admin_signature",
     safr_disposition_equivalent: "escalate",
+    decision_payload: {
+      ...common.decision_payload,
+      review_outcome: "escalate",
+    },
     required_admin_action: {
       status: "pending",
       admin_role: "administrator",
@@ -1051,7 +1617,12 @@ function buildReverificationDecision(input: ReverifyInput, hashes: {
   envelopeHash: string;
   firstVerifierDecisionHash: string;
   adminPayloadHash: string;
-}): BaseEventEnvelope<UnknownContent> {
+}, reasonCheck: ReasonCheckReport, reasonCheckInput: ReturnType<typeof buildReasonCheckInput>): BaseEventEnvelope<UnknownContent> {
+  const alignedReasonCheck = alignReasonCheckToDisposition(
+    reasonCheck,
+    "auto_execute",
+    "The administrator approval and the original signed transfer packet passed verifier re-check.",
+  );
   return createVerifierEnvelope(107, DEMO_PRINCIPALS.verifier, input.flowId, {
     reverify_id: `vrf_reverify_${Date.now()}`,
     instruction_ref: input.instructionEventId,
@@ -1079,7 +1650,10 @@ function buildReverificationDecision(input: ReverifyInput, hashes: {
       payload_version: "1.0",
       canonicalization: "jcs-rfc8785",
       decision_hash: `sha256:reverify_${Date.now()}`,
+      review_outcome: "auto_execute",
     },
+    reason_check: alignedReasonCheck,
+    reason_check_input: reasonCheckInput,
     next_step: "mcp_transfer_api_may_execute",
   });
 }
@@ -1096,6 +1670,15 @@ function buildAdminRejectDecision(input: ReverifyInput, reasonCode: string, reas
     rejection_reason: {
       code: reasonCode,
       message: reasonMessage,
+    },
+    decision_payload: {
+      payload_version: "1.0",
+      canonicalization: "jcs-rfc8785",
+      decision_hash: `sha256:reject_after_escalation_${Date.now()}`,
+      disposition: "deny",
+      signed_decision: "rejected",
+      reject_reason_code: reasonCode,
+      reject_reason_message: reasonMessage,
     },
     verification_result: {
       admin_signature_valid: reasonCode !== "admin_passkey_verification_failed",
@@ -1148,6 +1731,74 @@ const server = createServer(async (request, response) => {
             : "Failed to load current policy";
       sendJson(response, 400, {
         error: message,
+      });
+    }
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/verifier/recipient-allowlist") {
+    try {
+      const principalId = url.searchParams.get("principalId")?.trim() ?? "";
+      if (!principalId) {
+        throw new Error("principalId is required");
+      }
+
+      const accounts = await fetchRecipientAllowlist(principalId);
+      sendJson(response, 200, {
+        principalId,
+        allowedRecipientAccountRefs: accounts.map((account) => account.accountId),
+        accounts,
+        checkedAt: new Date().toISOString(),
+        source: "mcp-bank.accounts?ownerId=principalId",
+      });
+    } catch (error) {
+      sendJson(response, 400, {
+        error: error instanceof Error ? error.message : "Failed to load recipient allowlist",
+      });
+    }
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/verifier/review-reasoning") {
+    try {
+      const body = (await readJson(request)) as { flowId?: string; payload?: unknown };
+      const flowId = String(body.flowId ?? "").trim();
+      const payload = body.payload as ReturnType<typeof buildReasonCheckInput> | undefined;
+      if (!flowId) {
+        throw new Error("flowId is required");
+      }
+      if (!payload || typeof payload !== "object") {
+        throw new Error("payload is required");
+      }
+
+      sendJson(response, 200, {
+        flowId,
+        review: await (async () => {
+          const reviewResponse = await fetch(`${agentServiceBaseUrl}/review-reasoning`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ flowId, payload }),
+          });
+
+          if (!reviewResponse.ok) {
+            const body = (await reviewResponse.json().catch(() => ({}))) as {
+              detail?: string;
+              error?: string;
+            };
+            throw new Error(body.detail ?? body.error ?? `Reason check review failed: ${reviewResponse.status}`);
+          }
+
+          const reviewBody = (await reviewResponse.json()) as { review?: ReasonCheckReport };
+          const normalized = normalizeReasonCheck(reviewBody.review);
+          if (!normalized) {
+            throw new Error("Reason check review returned an invalid payload");
+          }
+          return normalized;
+        })(),
+      });
+    } catch (error) {
+      sendJson(response, 400, {
+        error: error instanceof Error ? error.message : "Reason check review failed",
       });
     }
     return;
@@ -1239,12 +1890,68 @@ const server = createServer(async (request, response) => {
         const instructionRecord = await fetchEvent(body.instructionEventId);
         const envelopeRecord = await fetchEvent(body.envelopeEventId);
         const instructionPayloadHash = buildInstructionPayloadHashOrThrow(instructionRecord);
-        decisionPayload = buildReverificationDecision(body, {
+        const currency = extractCurrency(envelopeRecord.payload);
+        const { bundle: activeBundle, policy } = getCurrentPolicy(currency);
+        const reasonCheckInput = buildReasonCheckInput({
+          flowId: body.flowId,
+          envelopeRecord,
+          instructionRecord,
+          policy,
+          activeBundle,
+          validationOverrides: {
+            policyDecision: "approved_after_admin_signature_reverify",
+            finalResult: "auto_execute",
+            reasoningNotes: [
+              "This is a post-escalation verifier re-check.",
+              "Administrator passkey proof was validated and is bound to the first verifier escalation.",
+            ],
+            extraLogicChecks: [
+              {
+                name: "Administrator approval binding",
+                status: "pass",
+                detail: "Administrator approval is bound to the same escalation record and transfer instruction.",
+              },
+              {
+                name: "Administrator passkey proof",
+                status: "pass",
+                detail: "Administrator passkey proof was validated for the administrator role.",
+              },
+            ],
+            validationSignals: {
+              review_phase: "post_admin_signature_reverify",
+              admin_review_ref: body.adminReviewEventId,
+              first_verifier_ref: body.firstVerifierEventId,
+              admin_signature_valid: true,
+              admin_passkey_verified: true,
+              admin_role_authorized: true,
+            },
+          },
+        });
+        let reasonCheck: ReasonCheckReport;
+        try {
+          reasonCheck = await fetchReasonCheck(reasonCheckInput);
+        } catch {
+          reasonCheck = reviewReasonCheckLocally(reasonCheckInput);
+        }
+
+        if (
+          reasonCheck.verdict === "fail" ||
+          reasonCheck.recommended_outcome === "deny" ||
+          reasonCheck.recommended_outcome === "escalate"
+        ) {
+          decisionPayload = buildAdminRejectDecision(
+            body,
+            "reverify_reason_check_failed",
+            reasonCheck.summary || "Verifier re-check did not approve the administrator-signed transfer",
+          );
+        } else {
+          decisionPayload = buildReverificationDecision(body, {
           instructionPayloadHash,
           envelopeHash: buildEnvelopeHash(envelopeRecord.payload),
           firstVerifierDecisionHash: buildEnvelopeHash(firstVerifierRecord.payload),
           adminPayloadHash: buildEnvelopeHash(adminReviewRecord.payload),
-        });
+          }, reasonCheck, reasonCheckInput);
+        }
       }
 
       const persisted = await writeEvent(body.flowId, decisionPayload);

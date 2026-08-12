@@ -376,6 +376,15 @@ const server = createServer(async (request, response) => {
       repository.touchSession(sessionId);
     }
 
+    try {
+      await bootstrapAccountSpace(account);
+    } catch (error) {
+      sendJson(response, 500, {
+        error: error instanceof Error ? error.message : "Failed to bootstrap account space",
+      });
+      return;
+    }
+
     sendJson(response, 200, {
       authenticated: true,
       account: serializeAccount(account),

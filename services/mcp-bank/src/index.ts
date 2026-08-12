@@ -120,6 +120,7 @@ function isExecutableVerifierDecision(record: EventServiceRecord): boolean {
   const decision = record.payload.content.decision;
   return (
     decision === "approved_auto_execute" ||
+    decision === "approved_under_observation" ||
     decision === "approved_after_admin_signature"
   );
 }
@@ -152,6 +153,11 @@ function createExecutionEventPayload(input: {
         typeof content.envelope_ref === "string" ? content.envelope_ref : "",
       transaction_id: input.transaction.transactionId,
       execution_status: input.transaction.status,
+      execution_disposition:
+        typeof content.safr_disposition_equivalent === "string"
+          ? content.safr_disposition_equivalent
+          : "unknown",
+      observation_flag: content.decision === "approved_under_observation",
       executed_at: input.transaction.createdAt,
       settlement: {
         from_account_id: input.transaction.fromAccountId,
@@ -168,7 +174,10 @@ function createExecutionEventPayload(input: {
         execution_sig: `mcp_bank_sig_${input.transaction.transactionId}`,
         execution_sig_alg: "ed25519",
       },
-      next_step: "archive_execution_and_expose_balance_update",
+      next_step:
+        content.decision === "approved_under_observation"
+          ? "archive_execution_and_expose_observed_balance_update"
+          : "archive_execution_and_expose_balance_update",
     },
   };
 }
